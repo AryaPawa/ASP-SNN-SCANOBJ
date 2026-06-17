@@ -65,22 +65,75 @@ def _spike(x: torch.Tensor) -> torch.Tensor:
 
 
 class LIFCell(nn.Module):
-    """Single LIF neuron layer with soft reset."""
+    """
+    Single LIF neuron layer with soft reset.
+
+    Tier-1 accuracy upgrades (all optional, controlled by flags):
+      - learnable_params: per-layer learnable leak and threshold, optimized
+        end-to-end via backprop. leak is constrained to (0,1) via sigmoid,
+        threshold to (0, inf) via softplus, for numerical safety.
+        Reference: DIET-SNN (Rathi & Roy) — learnable leak + threshold.
+      - use_mpbn: Membrane Potential BatchNorm — a BN applied to the membrane
+        potential AFTER the leaky update and BEFORE the spike function, which
+        normalizes the data flow that actually reaches the firing function.
+        Reference: Guo et al. "Membrane Potential Batch Normalization for
+        Spiking Neural Networks", ICCV 2023.
+    """
 
     def __init__(self, in_dim: int, out_dim: int,
-                 leak: float = 0.9, threshold: float = 1.0):
+                 leak: float = 0.9, threshold: float = 1.0,
+                 learnable_params: bool = False,
+                 use_mpbn: bool = False):
         super().__init__()
-        self.leak      = leak
-        self.threshold = threshold
-        self.out_dim   = out_dim
+        self.out_dim = out_dim
+        self.learnable_params = learnable_params
+        self.use_mpbn = use_mpbn
+
         self.fc = nn.Linear(in_dim, out_dim, bias=False)
         self.bn = nn.BatchNorm1d(out_dim)
 
+        if learnable_params:
+            # Parameterize so the constrained value starts at the given default.
+            # leak = sigmoid(raw_leak) -> invert: raw = logit(leak)
+            leak = min(max(leak, 1e-4), 1 - 1e-4)
+            raw_leak_init = math.log(leak / (1.0 - leak))
+            # threshold = softplus(raw_thr) -> invert: raw = log(exp(thr)-1)
+            raw_thr_init = math.log(math.expm1(threshold))
+            self.raw_leak = nn.Parameter(torch.tensor(raw_leak_init))
+            self.raw_threshold = nn.Parameter(torch.tensor(raw_thr_init))
+        else:
+            # Fixed scalars (registered as buffers so .to(device) works)
+            self.register_buffer('_leak', torch.tensor(float(leak)))
+            self.register_buffer('_threshold', torch.tensor(float(threshold)))
+
+        # Membrane Potential BatchNorm (applied to u before spiking)
+        if use_mpbn:
+            self.mpbn = nn.BatchNorm1d(out_dim)
+
+    @property
+    def leak(self):
+        if self.learnable_params:
+            return torch.sigmoid(self.raw_leak)
+        return self._leak
+
+    @property
+    def threshold(self):
+        if self.learnable_params:
+            return F.softplus(self.raw_threshold)
+        return self._threshold
+
     def step(self, x, u_prev, s_prev):
         """One timestep: x [B, in_dim] -> (u_new, s_new) each [B, out_dim]."""
+        leak = self.leak
+        threshold = self.threshold
+
         inp = F.relu(self.bn(self.fc(x)))
-        u_t = self.leak * u_prev + inp - self.threshold * s_prev
-        s_t = _spike(u_t - self.threshold)
+        u_t = leak * u_prev + inp - threshold * s_prev
+
+        # Membrane potential normalization before firing (MPBN)
+        u_for_spike = self.mpbn(u_t) if self.use_mpbn else u_t
+
+        s_t = _spike(u_for_spike - threshold)
         return u_t, s_t
 
 
@@ -132,7 +185,9 @@ class MultiLayerLIF(nn.Module):
                  num_layers: int = 3, leak: float = 0.9,
                  threshold: float = 1.0,
                  cls_head_dims: list = None,
-                 cls_head_dropout: list = None):
+                 cls_head_dropout: list = None,
+                 learnable_params: bool = False,
+                 use_mpbn: bool = False):
         super().__init__()
         self.num_layers = num_layers
         self.hidden_dim = hidden_dim
@@ -140,7 +195,8 @@ class MultiLayerLIF(nn.Module):
 
         dims_in = [feat_dim] + [hidden_dim] * (num_layers - 1)
         self.cells = nn.ModuleList([
-            LIFCell(d_in, hidden_dim, leak, threshold)
+            LIFCell(d_in, hidden_dim, leak, threshold,
+                    learnable_params=learnable_params, use_mpbn=use_mpbn)
             for d_in in dims_in
         ])
 

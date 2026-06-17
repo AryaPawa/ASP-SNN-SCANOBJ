@@ -32,9 +32,14 @@ class SSP(nn.Module):
     ) -> torch.Tensor:
         """
         Returns:
-            scores: [B, M] with visited entries = -inf
+            scores: [B, M] with visited entries masked to a very negative value
+
+        Note: we use a large finite negative value (-1e9) instead of -inf so
+        that Gumbel-softmax and argmax remain numerically stable even in the
+        edge case where ALL slices have been visited (would happen if T >= M).
+        With true -inf the softmax over all -inf values would produce NaN.
         """
         key   = self.key_proj(belief)                           # [B, d_ssp]
         query = self.query_proj(geo)                            # [B, M, d_ssp]
         scores = (query * key.unsqueeze(1)).sum(-1) * self.scale  # [B, M]
-        return scores.masked_fill(vis_mask, float('-inf'))
+        return scores.masked_fill(vis_mask, -1e9)

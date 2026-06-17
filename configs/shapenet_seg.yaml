@@ -57,4 +57,4 @@ eval_interval: 5
 log_dir: logs
 ckpt_dir: checkpoints
 seed: 42
-num_workers: 4
+num_workers: 8

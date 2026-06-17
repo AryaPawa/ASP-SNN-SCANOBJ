@@ -24,7 +24,7 @@ import glob
 import numpy as np
 from torch.utils.data import Dataset
 
-from .slicing import slice_point_cloud, assign_points_to_slices
+from .slicing import slice_point_cloud, assign_points_to_slices, compute_geo
 from .transforms import augment_seg
 
 
@@ -63,24 +63,40 @@ class S3DISDataset(Dataset):
         else:
             areas = [test_area]
 
-        # Load all room files
+        # Load all room files — support BOTH layouts:
+        #   Folder layout:  data_dir/Area_N/room_name.npy
+        #   Flat layout:    data_dir/raw/Area_N_room_name.npy  (OpenPoints)
+        #   Flat layout:    data_dir/Area_N_room_name.npy      (alternate)
         self.rooms = []
-        for area in areas:
-            area_dir = os.path.join(data_dir, f"Area_{area}")
-            if not os.path.isdir(area_dir):
-                raise FileNotFoundError(
-                    f"S3DIS area directory not found: {area_dir}\n"
-                    f"Run: python datasets/download.py --s3dis"
-                )
-            npy_files = sorted(glob.glob(os.path.join(area_dir, "*.npy")))
-            for npy_path in npy_files:
-                room_data = np.load(npy_path)  # [N, 7]: x,y,z,r,g,b,label
-                self.rooms.append(room_data.astype(np.float32))
+        npy_paths = self._discover_rooms(data_dir, areas)
 
-        if len(self.rooms) == 0:
+        if len(npy_paths) == 0:
             raise FileNotFoundError(
-                f"No .npy room files found for areas {areas} in {data_dir}"
+                f"No S3DIS .npy room files found for areas {areas} in {data_dir}\n"
+                f"Expected either:\n"
+                f"  - {data_dir}/Area_N/*.npy   (folder layout)\n"
+                f"  - {data_dir}/raw/Area_N_*.npy   (flat layout, OpenPoints)\n"
+                f"Run: python datasets/download.py --s3dis"
             )
+
+        for npy_path in npy_paths:
+            room_data = np.load(npy_path)  # [N, 7]: x,y,z,r,g,b,label
+            self.rooms.append(room_data.astype(np.float32))
+
+        # P0 FIX: Pre-compute per-ROOM z bounds for room-relative height
+        # normalization. Previously height was per-BLOCK which made floor=0
+        # and ceiling=1 meaningless within a small block.
+        # Now: height = (z - room_z_min) / (room_z_max - room_z_min) for the
+        # WHOLE room → floor of room = 0, ceiling of room = 1 (semantic).
+        self.room_z_bounds = []
+        for room in self.rooms:
+            z = room[:, 2]
+            z_min = float(z.min())
+            z_max = float(z.max())
+            # Guard against degenerate rooms (single floor scan, etc.)
+            if z_max - z_min < 1e-6:
+                z_max = z_min + 1.0
+            self.room_z_bounds.append((z_min, z_max))
 
         # For training: create a flat index of (room_idx, point_count)
         # so we can sample uniformly across rooms proportional to size
@@ -118,6 +134,42 @@ class S3DISDataset(Dataset):
 
     def __len__(self):
         return self._len
+
+    @staticmethod
+    def _discover_rooms(data_dir: str, areas: list) -> list:
+        """
+        Find all room .npy files for the requested areas.
+        Supports two common layouts:
+
+            (1) Folder layout (our default):
+                data_dir/Area_N/room_name.npy
+
+            (2) Flat layout (OpenPoints preprocessed s3disfull.tar):
+                data_dir/raw/Area_N_room_name.npy
+                data_dir/Area_N_room_name.npy
+
+        Returns sorted list of full file paths.
+        """
+        found = []
+        for area in areas:
+            # (1) Folder layout
+            area_dir = os.path.join(data_dir, f"Area_{area}")
+            if os.path.isdir(area_dir):
+                found.extend(sorted(glob.glob(os.path.join(area_dir, "*.npy"))))
+                continue
+
+            # (2) Flat layout — look in raw/ subfolder first, then data_dir
+            patterns = [
+                os.path.join(data_dir, "raw", f"Area_{area}_*.npy"),
+                os.path.join(data_dir, f"Area_{area}_*.npy"),
+            ]
+            for pat in patterns:
+                files = sorted(glob.glob(pat))
+                if files:
+                    found.extend(files)
+                    break  # only one layout per area
+
+        return found
 
     def _sample_block(self, room: np.ndarray,
                       cx: float = None, cy: float = None):
@@ -163,12 +215,13 @@ class S3DISDataset(Dataset):
                                       replace=True)
         return block_pts[choice]
 
-    def _prepare_features(self, block: np.ndarray):
+    def _prepare_features(self, block: np.ndarray, room_idx: int):
         """
         Prepare block data into sliceable point cloud and per-point features.
 
         Args:
-            block: [N, 7]  x,y,z,r,g,b,label
+            block:    [N, 7]  x,y,z,r,g,b,label
+            room_idx: index into self.room_z_bounds for per-room height normalization
 
         Returns:
             pts_for_slicing: [N, C]  for encoder (C matches in_channels)
@@ -179,16 +232,16 @@ class S3DISDataset(Dataset):
         rgb = block[:, 3:6].copy() / 255.0  # normalise to [0,1]
         labels = block[:, 6].astype(np.int64)
 
-        # Centre xyz within the block
-        xyz = xyz - xyz.mean(axis=0)
-
-        # Normalised height feature
+        # P0 FIX: Height feature is normalized PER-ROOM, not per-block.
+        # Computed BEFORE centering xyz since we need the absolute z values.
+        # Now floor of room = 0, ceiling of room = 1 (semantic meaning).
+        z_min, z_max = self.room_z_bounds[room_idx]
         z_vals = block[:, 2]
-        z_min, z_max = z_vals.min(), z_vals.max()
-        if z_max - z_min > 1e-6:
-            height = ((z_vals - z_min) / (z_max - z_min)).astype(np.float32)
-        else:
-            height = np.zeros(len(z_vals), dtype=np.float32)
+        height = ((z_vals - z_min) / (z_max - z_min)).astype(np.float32)
+        height = np.clip(height, 0.0, 1.0)  # guard against outliers
+
+        # Centre xyz within the block (height feature stays room-relative)
+        xyz = xyz - xyz.mean(axis=0)
 
         # Build slicing input: xyz + rgb + (optional height)
         # The encoder expects in_channels dimensions
@@ -214,7 +267,10 @@ class S3DISDataset(Dataset):
             room_idx, cx, cy = self.test_blocks[idx]
             block = self._sample_block(self.rooms[room_idx], cx, cy)
 
-        pts_for_slicing, pts_features, sem_labels = self._prepare_features(block)
+        # Pass room_idx so height is normalized per-ROOM (not per-block)
+        pts_for_slicing, pts_features, sem_labels = self._prepare_features(
+            block, room_idx
+        )
 
         # Slice
         M = getattr(self.cfg, 'num_slices', 16)
@@ -230,6 +286,9 @@ class S3DISDataset(Dataset):
         # Augment (training only)
         if self.split == 'train' and self.cfg is not None:
             slices, pts_features = augment_seg(slices, pts_features, self.cfg)
+            # P0 FIX: Recompute geo from augmented slices so positional encoding
+            # and SSP see the same geometry as the encoder.
+            geo = np.stack([compute_geo(s) for s in slices])
 
         return (
             slices.astype(np.float32),          # [M, K, C]
@@ -244,22 +303,36 @@ class S3DISDataset(Dataset):
 def compute_class_weights(data_dir: str, test_area: int = 5) -> np.ndarray:
     """
     Compute inverse-frequency class weights from training areas.
+    Supports both folder and flat S3DIS layouts.
+    Results are cached to data_dir/s3dis_class_weights.npy to avoid
+    recomputing on every training start.
 
     Returns:
         weights: [13] float32 normalised so max = 1.0
     """
+    cache_path = os.path.join(data_dir, f"s3dis_class_weights_area{test_area}.npy")
+    if os.path.exists(cache_path):
+        return np.load(cache_path).astype(np.float32)
+
+    train_areas = [a for a in [1, 2, 3, 4, 5, 6] if a != test_area]
+    npy_paths = S3DISDataset._discover_rooms(data_dir, train_areas)
+
     counts = np.zeros(NUM_CLASSES, dtype=np.float64)
-    for area in [a for a in [1, 2, 3, 4, 5, 6] if a != test_area]:
-        area_dir = os.path.join(data_dir, f"Area_{area}")
-        for npy_path in glob.glob(os.path.join(area_dir, "*.npy")):
-            room = np.load(npy_path)
-            labels = room[:, 6].astype(int)
-            for c in range(NUM_CLASSES):
-                counts[c] += (labels == c).sum()
+    for npy_path in npy_paths:
+        room = np.load(npy_path)
+        labels = room[:, 6].astype(int)
+        for c in range(NUM_CLASSES):
+            counts[c] += (labels == c).sum()
 
     # Inverse frequency, normalised
     total = counts.sum()
     freq = counts / total
     weights = 1.0 / (freq + 1e-8)
     weights = weights / weights.max()  # normalise so max weight = 1.0
-    return weights.astype(np.float32)
+    weights = weights.astype(np.float32)
+    # Cache for subsequent runs
+    try:
+        np.save(cache_path, weights)
+    except Exception:
+        pass
+    return weights

@@ -59,8 +59,12 @@ def main():
     set_seed(cfg.seed)
     device = cfg.device
 
+    test_area = getattr(cfg, 'test_area', 5)
+    train_areas_str = ", ".join(str(a) for a in [1, 2, 3, 4, 5, 6] if a != test_area)
+
     print(f"\n{'='*60}")
-    print(f"  ASP-SNN S3DIS Area {getattr(cfg, 'test_area', 5)} Scene Segmentation")
+    print(f"  ASP-SNN S3DIS Scene Segmentation")
+    print(f"  Protocol: train on Areas {{{train_areas_str}}}, test on Area {test_area}")
     print(f"  Epochs: {cfg.epochs}  LR: {cfg.lr}  Batch: {cfg.batch_size}")
     print(f"  Device: {device}")
     print(f"{'='*60}\n")
@@ -161,8 +165,10 @@ def main():
         # ── Train ─────────────────────────────────────────────────────
         model.train()
         total_loss = n_batches = 0
+        n_total_batches = len(train_loader)
+        log_every = max(1, n_total_batches // 20)  # ~20 progress prints per epoch
 
-        for slices, geo, pts_feat, sid_arr, sem_labels, cat_ids in train_loader:
+        for batch_idx, (slices, geo, pts_feat, sid_arr, sem_labels, cat_ids) in enumerate(train_loader):
             slices = slices.to(device, non_blocking=True)
             geo = geo.to(device, non_blocking=True)
             pts_feat = pts_feat.to(device, non_blocking=True)
@@ -190,6 +196,19 @@ def main():
 
             total_loss += loss.item()
             n_batches += 1
+
+            # Per-batch progress with ETA — fixes "no console output for 8 minutes"
+            if (batch_idx + 1) % log_every == 0 or (batch_idx + 1) == n_total_batches:
+                elapsed = time.time() - t0
+                per_batch = elapsed / (batch_idx + 1)
+                remaining = per_batch * (n_total_batches - batch_idx - 1)
+                gpu_mem = torch.cuda.max_memory_allocated() / 1e9 if torch.cuda.is_available() else 0
+                print(
+                    f"  ep{epoch+1} [{batch_idx+1:4d}/{n_total_batches}] "
+                    f"loss={loss.item():.4f} eta={remaining:.0f}s "
+                    f"gpu_mem={gpu_mem:.1f}GB",
+                    flush=True,
+                )
 
         scheduler.step()
         train_loss = total_loss / max(n_batches, 1)

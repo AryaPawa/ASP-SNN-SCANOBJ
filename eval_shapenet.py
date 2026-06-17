@@ -50,9 +50,14 @@ def compute_instance_miou(pred_parts, true_parts, cat_ids, n_points):
 
     inst_miou = float(np.mean(iou_per_shape)) if iou_per_shape else 0.0
     per_cat = {}
+    populated_ious = []
     for cat, ious in cat_ious.items():
-        per_cat[CATEGORY_NAMES[cat]] = float(np.mean(ious)) if ious else 0.0
-    cls_miou = float(np.mean(list(per_cat.values())))
+        if ious:
+            per_cat[CATEGORY_NAMES[cat]] = float(np.mean(ious))
+            populated_ious.append(per_cat[CATEGORY_NAMES[cat]])
+        else:
+            per_cat[CATEGORY_NAMES[cat]] = float('nan')
+    cls_miou = float(np.mean(populated_ious)) if populated_ious else 0.0
     return inst_miou, cls_miou, per_cat
 
 

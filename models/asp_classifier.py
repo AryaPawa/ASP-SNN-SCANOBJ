@@ -62,6 +62,25 @@ class ASPClassifier(nn.Module):
         self.belief_to_feat = nn.Linear(cfg.hidden_dim, cfg.feat_dim, bias=False)
         self.belief_norm = nn.LayerNorm(cfg.hidden_dim)
 
+        # Global context pathway.
+        # The ASP loop only visits T (=6) of M (=16) slices, so the classifier
+        # would otherwise see <40% of the object. We pool ALL encoded slice
+        # tokens (mean + max) into a global context vector and fuse it into
+        # every timestep's feature. This preserves active perception (the ASP
+        # loop still drives WHICH slice is the focus) while giving the head
+        # access to the whole object.
+        # Design follows the "glimpse + global context" pattern from hard-
+        # attention models (Mnih et al., Recurrent Models of Visual Attention,
+        # NeurIPS 2014). Mean+max pooling is standard for permutation-invariant
+        # set aggregation (Qi et al., PointNet, CVPR 2017).
+        self.global_context = nn.Sequential(
+            nn.Linear(cfg.feat_dim * 2, cfg.feat_dim, bias=False),
+            nn.LayerNorm(cfg.feat_dim),
+            nn.GELU(),
+        )
+        # Learnable gate so the model can balance focus-slice vs global context
+        self.context_gate = nn.Parameter(torch.tensor(0.5))
+
         # Deep MLP head if configured, otherwise single Linear
         cls_dims = getattr(cfg, 'cls_head_dims', None)
         cls_drop = getattr(cfg, 'cls_head_dropout', None)
@@ -75,6 +94,8 @@ class ASPClassifier(nn.Module):
             threshold=cfg.lif_threshold,
             cls_head_dims=cls_dims,
             cls_head_dropout=cls_drop,
+            learnable_params=getattr(cfg, 'lif_learnable', False),
+            use_mpbn=getattr(cfg, 'lif_use_mpbn', False),
         )
 
         self.register_buffer('gumbel_tau',
@@ -112,6 +133,15 @@ class ASPClassifier(nn.Module):
         all_feats = all_feats + pos
         all_feats = self.slice_transformer(all_feats)
 
+        # Global context over ALL M slices (mean + max pooling).
+        # This is the key fix: the classifier sees the whole object, not just
+        # the T slices the ASP loop selects.
+        ctx_mean = all_feats.mean(dim=1)                     # [B, feat_dim]
+        ctx_max  = all_feats.max(dim=1).values               # [B, feat_dim]
+        global_ctx = self.global_context(
+            torch.cat([ctx_mean, ctx_max], dim=-1)
+        )                                                     # [B, feat_dim]
+
         # ASP loop
         states     = self.lif_head.init_state(B, device)
         belief     = torch.zeros(B, self.cfg.hidden_dim, device=device)
@@ -119,6 +149,7 @@ class ASPClassifier(nn.Module):
         logits_all = []
 
         exit_thr = getattr(self.cfg, 'exit_threshold', 0.4)
+        gate = torch.sigmoid(self.context_gate)
 
         for t in range(self.cfg.T):
             scores = self.ssp(belief, geo_ord, vis_mask)
@@ -134,8 +165,11 @@ class ASPClassifier(nn.Module):
             vis_mask = vis_mask.clone()
             vis_mask[torch.arange(B, device=device), sel_idx] = True
 
+            # Fuse: actively-selected slice + belief + global context.
+            # The gate lets the model learn the focus/context balance.
             e_t = (w.unsqueeze(-1) * all_feats).sum(dim=1)
             e_t = e_t + self.belief_to_feat(states[-1][0].detach())
+            e_t = e_t + gate * global_ctx
 
             logits, states, u_last = self.lif_head.step(e_t, states)
             logits_all.append(logits)

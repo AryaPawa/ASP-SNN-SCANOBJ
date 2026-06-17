@@ -9,32 +9,45 @@ Usage:
 """
 
 import argparse
+import math
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
 from config import load_config, set_seed
 from datasets.scanobjectnn import ScanObjectNNDataset
+from datasets.slicing import compute_geo_torch
 from models.asp_classifier import ASPClassifier
 
 
 def augment_vote_gpu(slices, geo):
-    """One random z-rotation augmentation on GPU tensors for TTA."""
+    """
+    One random z-rotation augmentation on GPU tensors for TTA.
+
+    P1 FIX: previously only the centroid (geo[:,:,:3]) was rotated and
+    variance/max_dist were left stale. Now we recompute the FULL 8-dim geo
+    descriptor from the rotated slices so SSP sees consistent geometry.
+    """
     device, dtype = slices.device, slices.dtype
-    theta = float(np.random.uniform(0, 2 * np.pi))
-    c, s = np.cos(theta), np.sin(theta)
+    theta = float(np.random.uniform(0, 2 * math.pi))
+    c, s = math.cos(theta), math.sin(theta)
     rot = torch.tensor(
         [[c, -s, 0.], [s, c, 0.], [0., 0., 1.]],
         device=device, dtype=dtype,
     )
 
     B, M, K, C = slices.shape
-    xyz = slices[:, :, :, :3].reshape(-1, 3) @ rot
     slices_aug = slices.clone()
-    slices_aug[:, :, :, :3] = xyz.reshape(B, M, K, 3)
+    # Rotate xyz channels
+    slices_aug[:, :, :, :3] = slices[:, :, :, :3] @ rot
+    # If normals are present (ShapeNet uses zero-pad, ScanObjectNN uses zero)
+    # rotate them too — harmless for zeros, correct for real normals
+    if C >= 6:
+        slices_aug[:, :, :, 3:6] = slices[:, :, :, 3:6] @ rot
 
-    geo_aug = geo.clone()
-    geo_aug[:, :, :3] = geo[:, :, :3] @ rot
+    # Recompute the full 8-dim geo descriptor (centroid, variance, max_dist,
+    # dist_to_origin) from the rotated slices on GPU
+    geo_aug = compute_geo_torch(slices_aug)
 
     return slices_aug, geo_aug
 

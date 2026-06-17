@@ -18,7 +18,7 @@ import os
 import numpy as np
 from torch.utils.data import Dataset
 
-from .slicing import slice_point_cloud
+from .slicing import slice_point_cloud, compute_geo
 from .transforms import augment_slices
 
 
@@ -29,16 +29,21 @@ _TEST_FILE = "test_objectdataset_augmentedrot_scale75.h5"
 
 class ScanObjectNNDataset(Dataset):
 
-    def __init__(self, data_dir: str, split: str, cfg=None):
+    def __init__(self, data_dir: str, split: str, cfg=None,
+                 force_no_aug: bool = False):
         """
         Args:
             data_dir: path to ScanObjectNN/main_split/
             split:    'train' or 'test'
             cfg:      config object
+            force_no_aug: if True, disable augmentation even when split='train'.
+                          Used for the validation subset which should match
+                          the test distribution, not the augmented train one.
         """
         assert split in ('train', 'test')
         self.split = split
         self.cfg = cfg
+        self.force_no_aug = force_no_aug
         self.n_points = getattr(cfg, 'num_points', 2048)
 
         try:
@@ -81,13 +86,20 @@ class ScanObjectNNDataset(Dataset):
     def __getitem__(self, idx):
         label = int(self.labels[idx])
 
-        # Sample points if we have more than needed
+        # Sample points if we have more than needed.
+        # P2 FIX: at test time use a per-idx deterministic RNG so the same
+        # sample always produces the same point subset across eval passes.
         raw = self.pts[idx]  # [2048, 3]
+        if self.split == 'test':
+            rng = np.random.default_rng(idx)
+        else:
+            rng = np.random
+
         if len(raw) > self.n_points:
-            choice = np.random.choice(len(raw), self.n_points, replace=False)
+            choice = rng.choice(len(raw), self.n_points, replace=False)
             raw = raw[choice]
         elif len(raw) < self.n_points:
-            choice = np.random.choice(len(raw), self.n_points, replace=True)
+            choice = rng.choice(len(raw), self.n_points, replace=True)
             raw = raw[choice]
 
         pts_n = self._normalise(raw)
@@ -103,9 +115,12 @@ class ScanObjectNNDataset(Dataset):
         fps_seed = idx if self.split == 'test' else None
         slices, geo, _ = slice_point_cloud(pts6, M, K, seed=fps_seed)
 
-        # Augment (training only)
-        if self.split == 'train' and self.cfg is not None:
+        # Augment (training only, unless force_no_aug)
+        if self.split == 'train' and self.cfg is not None and not self.force_no_aug:
             slices = augment_slices(slices, self.cfg)
+            # P0 FIX: Recompute geo from augmented slices so positional encoding
+            # and SSP see the same geometry as the encoder.
+            geo = np.stack([compute_geo(s) for s in slices])
 
         return (
             slices.astype(np.float32),  # [M, K, 6]

@@ -10,11 +10,10 @@ import os
 import time
 from datetime import datetime
 
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader, Subset
 from torch.amp import autocast, GradScaler
 from torch.optim.swa_utils import AveragedModel, SWALR
 
@@ -47,16 +46,23 @@ def main():
 
     # ── Datasets ──────────────────────────────────────────────────────
     train_ds = ScanObjectNNDataset(cfg.data_dir, 'train', cfg)
+    # P0 FIX: Validation must use UN-AUGMENTED data so val acc tracks test acc
+    val_ds_clean = ScanObjectNNDataset(cfg.data_dir, 'train', cfg, force_no_aug=True)
     test_ds = ScanObjectNNDataset(cfg.data_dir, 'test', cfg)
 
     val_frac = getattr(cfg, 'val_fraction', 0.1)
     n_val = int(len(train_ds) * val_frac)
     n_train = len(train_ds) - n_val
-    train_sub, val_sub = random_split(
-        train_ds, [n_train, n_val],
+    # Generate split indices deterministically and apply to both datasets
+    indices = torch.randperm(
+        len(train_ds),
         generator=torch.Generator().manual_seed(cfg.seed),
-    )
-    print(f"Train: {n_train} | Val: {n_val} | Test: {len(test_ds)}")
+    ).tolist()
+    val_indices = indices[:n_val]
+    train_indices = indices[n_val:]
+    train_sub = Subset(train_ds, train_indices)
+    val_sub = Subset(val_ds_clean, val_indices)  # uses clean data
+    print(f"Train: {n_train} | Val: {n_val} (no aug) | Test: {len(test_ds)}")
 
     # drop_last safety: only drop if we have enough samples to spare
     drop_last = n_train >= cfg.batch_size * 2
@@ -116,9 +122,22 @@ def main():
     label_smooth = getattr(cfg, 'label_smooth', 0.1)
     criterion = nn.CrossEntropyLoss(label_smoothing=label_smooth)
 
-    # Aux weights and their sum (for normalised loss display)
+    # Aux weights and their sum (for the quadratic-ramp weighting scheme)
     aux_w = ASPClassifier.aux_weights(cfg.T)
     aux_w_sum = sum(aux_w)
+
+    # Loss mode:
+    #   'tet'  -> Temporal Efficient Training (Deng et al. ICLR 2022):
+    #             mean of per-timestep CE with EQUAL weight. Forces every
+    #             timestep's output to be independently discriminative,
+    #             which improves SNN generalization and convergence.
+    #   'aux'  -> the original quadratic-ramp weighted sum (legacy).
+    loss_mode = getattr(cfg, 'loss_mode', 'tet')
+    # Optional TET regularization: small MSE pulling each timestep's logits
+    # toward the final-timestep target distribution stabilizes training.
+    tet_lambda = getattr(cfg, 'tet_lambda', 0.0)
+    print(f"Loss mode: {loss_mode}" +
+          (f" (TET lambda={tet_lambda})" if loss_mode == 'tet' else ""))
 
     # ── Resume ────────────────────────────────────────────────────────
     start_epoch = 0
@@ -149,8 +168,10 @@ def main():
         # ── Train ─────────────────────────────────────────────────────
         model.train()
         total_loss = total_correct = total_samples = 0
+        n_total_batches = len(train_loader)
+        log_every = max(1, n_total_batches // 10)
 
-        for slices, geo, labels in train_loader:
+        for batch_idx, (slices, geo, labels) in enumerate(train_loader):
             slices = slices.to(device, non_blocking=True)
             geo = geo.to(device, non_blocking=True)
             labels = labels.to(device, non_blocking=True)
@@ -159,13 +180,33 @@ def main():
             with autocast(device_type=device.type, enabled=cfg.use_amp):
                 logits_all = model(slices, geo, training=True)
                 T_actual = len(logits_all)
-                # Normalize by sum of aux weights so effective LR matches config
-                # Without this, loss is ~2.58x higher than single-timestep CE,
-                # inflating the effective learning rate proportionally.
-                loss = sum(
-                    aux_w[t] * criterion(logits_all[t], labels)
-                    for t in range(min(T_actual, len(aux_w)))
-                ) / aux_w_sum
+
+                if loss_mode == 'tet':
+                    # TET: equal-weight mean of per-timestep CE.
+                    # Reference: Deng et al. "Temporal Efficient Training of
+                    # Spiking Neural Networks via Gradient Re-weighting",
+                    # ICLR 2022. Each timestep is supervised equally so the
+                    # network learns a discriminative output at every step.
+                    ce_terms = torch.stack([
+                        criterion(logits_all[t], labels)
+                        for t in range(T_actual)
+                    ])
+                    loss = ce_terms.mean()
+
+                    # Optional regularization toward the final logits
+                    if tet_lambda > 0 and T_actual > 1:
+                        final = logits_all[-1].detach()
+                        mse = torch.stack([
+                            F.mse_loss(logits_all[t], final)
+                            for t in range(T_actual - 1)
+                        ]).mean()
+                        loss = loss + tet_lambda * mse
+                else:
+                    # Legacy: quadratic-ramp weighted sum, normalized
+                    loss = sum(
+                        aux_w[t] * criterion(logits_all[t], labels)
+                        for t in range(min(T_actual, len(aux_w)))
+                    ) / aux_w_sum
 
             optimizer.zero_grad()
             scaler.scale(loss).backward()
@@ -178,6 +219,13 @@ def main():
             preds = logits_all[-1].argmax(dim=-1)
             total_correct += (preds == labels).sum().item()
             total_samples += B
+
+            if (batch_idx + 1) % log_every == 0 or (batch_idx + 1) == n_total_batches:
+                elapsed = time.time() - t0
+                per_batch = elapsed / (batch_idx + 1)
+                remaining = per_batch * (n_total_batches - batch_idx - 1)
+                print(f"  ep{epoch+1} [{batch_idx+1:4d}/{n_total_batches}] "
+                      f"loss={loss.item():.4f} eta={remaining:.0f}s", flush=True)
 
         # LR scheduling
         if use_swa and epoch >= swa_start:

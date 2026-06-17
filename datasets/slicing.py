@@ -76,7 +76,7 @@ def build_slices(points: np.ndarray, anchors: np.ndarray,
 
 def compute_geo(slice_pts: np.ndarray) -> np.ndarray:
     """
-    8-dim geometry descriptor for one slice.
+    8-dim geometry descriptor for one slice (numpy version).
 
     Args:
         slice_pts: [K, C] with C >= 3
@@ -93,6 +93,33 @@ def compute_geo(slice_pts: np.ndarray) -> np.ndarray:
     return np.concatenate([
         centroid, variance, [max_dist], [dist_to_origin]
     ]).astype(np.float32)
+
+
+def compute_geo_torch(slices: "torch.Tensor") -> "torch.Tensor":
+    """
+    Torch version of compute_geo that operates batched on GPU.
+
+    Args:
+        slices: [B, M, K, C] with C >= 3
+
+    Returns:
+        geo: [B, M, 8] float32
+
+    Used during TTA to recompute geo descriptors after rotation augmentation
+    on GPU, avoiding stale variance/max_dist fields.
+    """
+    import torch
+    xyz = slices[..., :3]                                            # [B,M,K,3]
+    centroid = xyz.mean(dim=2)                                       # [B,M,3]
+    variance = xyz.var(dim=2, unbiased=False)                        # [B,M,3]
+    dists = torch.linalg.norm(
+        xyz - centroid.unsqueeze(2), dim=-1
+    )                                                                 # [B,M,K]
+    max_dist = dists.max(dim=-1).values.unsqueeze(-1)                # [B,M,1]
+    dist_to_origin = torch.linalg.norm(
+        centroid, dim=-1, keepdim=True
+    )                                                                 # [B,M,1]
+    return torch.cat([centroid, variance, max_dist, dist_to_origin], dim=-1)
 
 
 def slice_point_cloud(points: np.ndarray, num_slices: int = 16,

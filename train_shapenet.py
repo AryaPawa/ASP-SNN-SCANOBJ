@@ -36,9 +36,12 @@ def seg_loss_fn(part_logits, part_labels, cat_ids):
     B, N, P = part_logits.shape
     device = part_logits.device
 
+    # P1 FIX: pre-fetch cat_ids to CPU once instead of .item() inside the
+    # inner loop (which forces B CPU syncs per forward pass).
+    cat_ids_cpu = cat_ids.detach().cpu().tolist()
     valid_mask = torch.zeros(B, P, device=device, dtype=torch.bool)
     for b in range(B):
-        for pid in CATEGORY_TO_PARTS[int(cat_ids[b].item())]:
+        for pid in CATEGORY_TO_PARTS[cat_ids_cpu[b]]:
             valid_mask[b, pid] = True
 
     mask_expanded = valid_mask.unsqueeze(1).expand(B, N, P)
@@ -82,9 +85,16 @@ def compute_instance_miou(pred_parts, true_parts, cat_ids, n_points):
 
     inst_miou = float(np.mean(iou_per_shape)) if iou_per_shape else 0.0
     per_cat = {}
+    populated_ious = []
     for cat, ious in cat_ious.items():
-        per_cat[CATEGORY_NAMES[cat]] = float(np.mean(ious)) if ious else 0.0
-    cls_miou = float(np.mean(list(per_cat.values())))
+        if ious:
+            per_cat[CATEGORY_NAMES[cat]] = float(np.mean(ious))
+            populated_ious.append(per_cat[CATEGORY_NAMES[cat]])
+        else:
+            # Category absent from test split → mark explicitly but don't drag
+            # cls_miou down with a 0.
+            per_cat[CATEGORY_NAMES[cat]] = float('nan')
+    cls_miou = float(np.mean(populated_ious)) if populated_ious else 0.0
     return inst_miou, cls_miou, per_cat
 
 
@@ -191,8 +201,10 @@ def main():
         # ── Train ─────────────────────────────────────────────────────
         model.train()
         total_loss = n_batches = 0
+        n_total_batches = len(train_loader)
+        log_every = max(1, n_total_batches // 10)
 
-        for slices, geo, pts_xyz, sid_arr, part_labels, cat_ids in train_loader:
+        for batch_idx, (slices, geo, pts_xyz, sid_arr, part_labels, cat_ids) in enumerate(train_loader):
             slices = slices.to(device, non_blocking=True)
             geo = geo.to(device, non_blocking=True)
             pts_xyz = pts_xyz.to(device, non_blocking=True)
@@ -215,6 +227,13 @@ def main():
 
             total_loss += loss.item()
             n_batches += 1
+
+            if (batch_idx + 1) % log_every == 0 or (batch_idx + 1) == n_total_batches:
+                elapsed = time.time() - t0
+                per_batch = elapsed / (batch_idx + 1)
+                remaining = per_batch * (n_total_batches - batch_idx - 1)
+                print(f"  ep{epoch+1} [{batch_idx+1:4d}/{n_total_batches}] "
+                      f"loss={loss.item():.4f} eta={remaining:.0f}s", flush=True)
 
         scheduler.step()
         train_loss = total_loss / max(n_batches, 1)

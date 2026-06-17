@@ -108,6 +108,18 @@ def set_seed(seed: int = 42):
     torch.backends.cudnn.deterministic = False
     torch.backends.cudnn.benchmark = True
 
+    # P2 OPTIMIZE: Enable TF32 on H100/A100 for ~10% free speedup with
+    # negligible accuracy impact (matmul TF32 has ~1e-3 relative error,
+    # well below the noise floor of our SNN gradients).
+    # Reference: NVIDIA H100 Tensor Core documentation.
+    if torch.cuda.is_available():
+        try:
+            torch.set_float32_matmul_precision('high')
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+        except Exception:
+            pass
+
 
 def base_argparser(description: str = "ASP-SNN") -> argparse.ArgumentParser:
     """Shared argument parser used by all training/eval scripts."""

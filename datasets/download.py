@@ -1,3 +1,4 @@
+
 """
 datasets/download.py — Download and prepare all three datasets.
 
@@ -31,14 +32,18 @@ DATA_ROOT = "data"
 # ═══════════════════════════════════════════════════════════════════════
 
 SHAPENET_URL = "https://shapenet.cs.stanford.edu/media/shapenet_part_seg_hdf5_data.zip"
+# Public Google Drive mirror (used by PointNeXt and others)
+SHAPENET_GDRIVE_ID = "1tEnSGAdgfp-NPVS5y_ALD8eF18bzwhM_"
 SHAPENET_DIR = "shapenet_part_seg_hdf5_data"
 
 
 def download_shapenet():
     """
-    ShapeNetPart HDF5 — direct from Stanford.
-    ~346 MB zip. No authentication required.
-    Contains train0-5.h5, test0-1.h5 with 14,007 train / 2,874 test shapes.
+    ShapeNetPart HDF5 — multi-source download.
+    Tries in order:
+      1. Stanford direct URL
+      2. Google Drive mirror via gdown
+      3. Manual instructions (incl. Kaggle raw + conversion)
     """
     out_dir = os.path.join(DATA_ROOT, SHAPENET_DIR)
     sentinel = os.path.join(out_dir, "all_object_categories.txt")
@@ -48,27 +53,67 @@ def download_shapenet():
         return True
 
     os.makedirs(DATA_ROOT, exist_ok=True)
+
+    # ── Method 1: Stanford direct ──────────────────────────────────────
+    print(f"[ShapeNet] Trying Stanford direct ({SHAPENET_URL}) ...")
     zip_path = os.path.join(DATA_ROOT, "shapenet_part_seg_hdf5_data.zip")
-
-    print(f"[ShapeNet] Downloading from Stanford ({SHAPENET_URL}) ...")
     try:
-        _download_with_progress(SHAPENET_URL, zip_path)
+        _download_with_progress(SHAPENET_URL, zip_path, timeout=30)
+        print(f"[ShapeNet] Extracting ...")
+        with zipfile.ZipFile(zip_path, 'r') as zf:
+            zf.extractall(DATA_ROOT)
+        os.remove(zip_path)
+        if os.path.exists(sentinel):
+            print(f"[ShapeNet] Done (from Stanford)")
+            return True
     except Exception as e:
-        print(f"[ShapeNet] FAILED: {e}")
-        print("[ShapeNet] The Stanford server may be temporarily down.")
-        print(f"[ShapeNet] Manual: wget {SHAPENET_URL} -O {zip_path}")
-        return False
+        print(f"[ShapeNet] Stanford failed: {e}")
+        if os.path.exists(zip_path):
+            os.remove(zip_path)
 
-    print(f"[ShapeNet] Extracting ...")
-    with zipfile.ZipFile(zip_path, 'r') as zf:
-        zf.extractall(DATA_ROOT)
-    os.remove(zip_path)
+    # ── Method 2: gdown from Google Drive ──────────────────────────────
+    print("[ShapeNet] Trying Google Drive mirror via gdown ...")
+    try:
+        import gdown
+        gdown.download(id=SHAPENET_GDRIVE_ID, output=zip_path, quiet=False)
+        if os.path.exists(zip_path) and os.path.getsize(zip_path) > 1_000_000:
+            print(f"[ShapeNet] Extracting ...")
+            with zipfile.ZipFile(zip_path, 'r') as zf:
+                zf.extractall(DATA_ROOT)
+            os.remove(zip_path)
+            if os.path.exists(sentinel):
+                print(f"[ShapeNet] Done (from gdown mirror)")
+                return True
+    except ImportError:
+        print("[ShapeNet] gdown not installed (pip install gdown)")
+    except Exception as e:
+        print(f"[ShapeNet] gdown failed: {e}")
+        if os.path.exists(zip_path):
+            os.remove(zip_path)
 
-    import glob
-    n_train = len(glob.glob(os.path.join(out_dir, "train*.h5")))
-    n_test = len(glob.glob(os.path.join(out_dir, "test*.h5")))
-    print(f"[ShapeNet] Done: {n_train} train + {n_test} test H5 files")
-    return True
+    # ── Method 3: Manual instructions ──────────────────────────────────
+    print()
+    print("=" * 60)
+    print("  ShapeNetPart auto-download failed from all sources")
+    print("=" * 60)
+    print()
+    print("  Option A: Download from Kaggle and convert to HDF5")
+    print("    1. Install Kaggle CLI:    pip install kaggle")
+    print("    2. Set up API key:        https://www.kaggle.com/docs/api")
+    print("    3. Download (any of these works):")
+    print("       kaggle datasets download -d mitkir/shapenet -p data/")
+    print("    4. Extract the .zip into data/shapenetcore_partanno_*/")
+    print("    5. Convert to HDF5:")
+    print("       python datasets/convert_shapenet_raw.py \\")
+    print("           --raw_dir data/shapenetcore_partanno_segmentation_benchmark_v0_normal \\")
+    print("           --out_dir data/shapenet_part_seg_hdf5_data")
+    print()
+    print("  Option B: Manual Stanford download")
+    print(f"    1. Visit:  {SHAPENET_URL}")
+    print(f"    2. Place the .zip in {DATA_ROOT}/")
+    print(f"    3. Re-run: python datasets/download.py --shapenet")
+    print()
+    return False
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -349,8 +394,10 @@ def preprocess_s3dis_raw(raw_dir: str):
 #  Utilities
 # ═══════════════════════════════════════════════════════════════════════
 
-def _download_with_progress(url: str, dest: str):
-    """Download with progress bar."""
+def _download_with_progress(url: str, dest: str, timeout: int = 60):
+    """Download with progress bar and connection timeout."""
+    import socket
+    socket.setdefaulttimeout(timeout)
     try:
         from tqdm import tqdm
 
@@ -366,6 +413,8 @@ def _download_with_progress(url: str, dest: str):
     except ImportError:
         print(f"  Downloading {os.path.basename(dest)} (no progress bar) ...")
         urllib.request.urlretrieve(url, dest)
+    finally:
+        socket.setdefaulttimeout(None)
 
 
 # ═══════════════════════════════════════════════════════════════════════

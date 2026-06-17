@@ -1,5 +1,7 @@
-# configs/s3dis_seg.yaml — S3DIS Area 5 scene segmentation
+# configs/s3dis_seg.yaml — S3DIS scene segmentation
+# Protocol: train on Areas 1,2,3,4,6 — test on Area 5
 # Target: 55-62% mIoU
+# Optimised for NVIDIA H100 80GB
 
 # ── Dataset ────────────────────────────────────────────────────────────
 dataset: s3dis
@@ -11,7 +13,7 @@ test_area: 5
 block_size: 1.0
 use_rgb: true
 use_height: true
-input_channels: 7        # xyz(3) + rgb(3) + height(1), padded to match encoder
+input_channels: 7        # xyz(3) + rgb(3) + height(1)
 
 # ── Slicing ────────────────────────────────────────────────────────────
 num_slices: 16
@@ -31,10 +33,10 @@ d_ssp: 128
 T: 6
 point_feat_dim: 64
 
-# ── Training ───────────────────────────────────────────────────────────
-epochs: 100
-batch_size: 16
-lr: 1e-3
+# ── Training (H100-tuned: larger batch, fewer epochs) ──────────────────
+epochs: 100              # 100 is sufficient for S3DIS (most papers use 100-300)
+batch_size: 64           # H100 80GB can easily handle 64; was 16 = 4x increase
+lr: 0.002                # Scaled with sqrt(4) for stability vs original lr=1e-3
 weight_decay: 0.01
 grad_clip: 1.0
 warmup_epochs: 5
@@ -62,4 +64,4 @@ eval_interval: 5
 log_dir: logs
 ckpt_dir: checkpoints
 seed: 42
-num_workers: 4
+num_workers: 8           # H100 cluster typically has 32+ CPUs

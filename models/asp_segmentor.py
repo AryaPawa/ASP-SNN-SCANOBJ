@@ -151,6 +151,8 @@ class ASPSegmentor(nn.Module):
             num_layers=cfg.num_lif_layers,
             leak=cfg.lif_leak,
             threshold=cfg.lif_threshold,
+            learnable_params=getattr(cfg, 'lif_learnable', False),
+            use_mpbn=getattr(cfg, 'lif_use_mpbn', False),
         )
 
         self.register_buffer('gumbel_tau',
