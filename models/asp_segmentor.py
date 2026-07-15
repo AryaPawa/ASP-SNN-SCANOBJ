@@ -139,6 +139,7 @@ class ASPSegmentor(nn.Module):
             belief_dim=cfg.hidden_dim,
             geo_dim=cfg.geo_dim,
             d_ssp=cfg.d_ssp,
+            mode=getattr(cfg, 'ssp_mode', 'learned'),
         )
         self.belief_to_feat = nn.Linear(cfg.hidden_dim, cfg.feat_dim, bias=False)
         self.belief_norm    = nn.LayerNorm(cfg.hidden_dim)

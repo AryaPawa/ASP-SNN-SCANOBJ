@@ -26,6 +26,14 @@ d_ssp: 128
 T: 6
 exit_threshold: 0.40
 
+# ── SSP ablation (go/no-go for the active-perception thesis) ───────────
+# 'learned'   : attention-based slice selection (the proposed method)
+# 'random'    : random unvisited slice each step (ablation baseline)
+# 'fps_order' : fixed FPS-order traversal (non-adaptive baseline)
+# Run all three with identical settings; 'learned' must beat the others
+# for the active-perception contribution to hold.
+ssp_mode: learned
+
 # ── Tier-1 accuracy upgrades (SNN training best practices) ─────────────
 # TET loss: equal-weight per-timestep CE (Deng et al. ICLR 2022)
 loss_mode: tet           # 'tet' or 'aux' (legacy weighted-sum)

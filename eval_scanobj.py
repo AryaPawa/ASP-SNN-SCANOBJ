@@ -52,13 +52,20 @@ def augment_vote_gpu(slices, geo):
     return slices_aug, geo_aug
 
 
-def evaluate(model, loader, device, n_votes=1):
-    """Evaluate with optional TTA."""
+def evaluate(model, loader, device, n_votes=1, measure_energy=False):
+    """Evaluate with optional TTA and optional spike-rate measurement."""
     model.eval()
     all_probs = []
     all_labels = []
     total_slices = 0
     total_samples = 0
+
+    # Attach spike monitor to the LIF head to measure firing rate
+    logger = None
+    if measure_energy:
+        from models.lif import SpikeRateLogger
+        logger = SpikeRateLogger()
+        model.lif_head.spike_monitor = logger
 
     with torch.no_grad():
         for slices, geo, labels in loader:
@@ -104,7 +111,13 @@ def evaluate(model, loader, device, n_votes=1):
     macc = per_class_acc.mean().item()
     avg_slices = total_slices / max(total_samples, 1)
 
-    return oa, macc, per_class_acc, avg_slices
+    # Detach monitor and read mean firing rate
+    mean_fr = None
+    if logger is not None:
+        mean_fr = logger.mean_rate()
+        model.lif_head.spike_monitor = None
+
+    return oa, macc, per_class_acc, avg_slices, mean_fr
 
 
 def main():
@@ -114,11 +127,18 @@ def main():
     p.add_argument("--n_votes", type=int, default=1,
                    help="Number of TTA votes (1=no TTA)")
     p.add_argument("--batch", type=int, default=None)
+    p.add_argument("--energy", action="store_true",
+                   help="Measure spike rate and report energy accounting")
+    p.add_argument("--ssp_mode", type=str, default=None,
+                   choices=['learned', 'random', 'fps_order'],
+                   help="Override SSP mode (for ablation eval)")
     args = p.parse_args()
 
     cfg = load_config(args.config)
     if args.batch:
         cfg.batch_size = args.batch
+    if args.ssp_mode:
+        cfg.ssp_mode = args.ssp_mode
     set_seed(cfg.seed)
     device = cfg.device
 
@@ -143,10 +163,11 @@ def main():
     print(f"Epoch      : {ckpt.get('epoch', '?')}")
     print(f"Parameters : {sum(p.numel() for p in model.parameters()):,}")
     print(f"TTA votes  : {args.n_votes}")
+    print(f"SSP mode   : {getattr(cfg, 'ssp_mode', 'learned')}")
 
     # Evaluate
-    oa, macc, per_class_acc, avg_slices = evaluate(
-        model, loader, device, args.n_votes
+    oa, macc, per_class_acc, avg_slices, mean_fr = evaluate(
+        model, loader, device, args.n_votes, measure_energy=args.energy
     )
 
     print(f"\n{'='*50}")
@@ -161,6 +182,12 @@ def main():
         acc = per_class_acc[c].item()
         bar = "#" * int(acc * 30)
         print(f"    Class {c:2d}  {acc*100:5.1f}%  {bar}")
+
+    # Energy accounting
+    if args.energy and mean_fr is not None:
+        from models.energy import compute_energy, print_energy_report
+        energy = compute_energy(cfg, mean_fr)
+        print_energy_report(energy)
     print()
 
 
