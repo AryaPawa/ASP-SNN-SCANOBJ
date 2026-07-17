@@ -47,6 +47,17 @@ ssp_mode: learned
 # TET loss: equal-weight per-timestep CE (Deng et al. ICLR 2022)
 loss_mode: tet           # 'tet' or 'aux' (legacy weighted-sum)
 tet_lambda: 0.05         # MSE regularization toward final-step logits
+
+# ── Knowledge Distillation (training-time only, zero inference cost) ───
+# When teacher_logits_path is set AND the file exists, ASP-SNN trains with
+# a KD loss pulling per-timestep logits toward a DGCNN teacher's soft targets.
+# Total loss = (1-alpha)*CE + alpha*T^2*KL(student/T || teacher/T)
+# Reference: Hinton et al. "Distilling the Knowledge in a Neural Network" (2015)
+# The teacher is precomputed by train_dgcnn_teacher.py — never loaded during
+# ASP-SNN training or inference, so KD does NOT affect the efficiency claim.
+teacher_logits_path: data/ScanObjectNN/teacher_logits.pt
+kd_alpha: 0.5            # weight on KD vs CE (0=no KD, 1=only KD)
+kd_temperature: 4.0      # softmax temperature for softening targets
 # Learnable LIF leak + threshold (DIET-SNN, Rathi & Roy)
 lif_learnable: true
 # Membrane Potential BatchNorm before firing (Guo et al. ICCV 2023)

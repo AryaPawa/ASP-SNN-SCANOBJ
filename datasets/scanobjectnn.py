@@ -30,7 +30,8 @@ _TEST_FILE = "test_objectdataset_augmentedrot_scale75.h5"
 class ScanObjectNNDataset(Dataset):
 
     def __init__(self, data_dir: str, split: str, cfg=None,
-                 force_no_aug: bool = False):
+                 force_no_aug: bool = False,
+                 teacher_logits_path: str = None):
         """
         Args:
             data_dir: path to ScanObjectNN/main_split/
@@ -39,12 +40,29 @@ class ScanObjectNNDataset(Dataset):
             force_no_aug: if True, disable augmentation even when split='train'.
                           Used for the validation subset which should match
                           the test distribution, not the augmented train one.
+            teacher_logits_path: if provided (and split=='train'), load
+                          pre-computed DGCNN teacher logits from this file and
+                          return them alongside each sample for KD.
+                          File format is {logits: [N, C], indices: [N]}.
         """
         assert split in ('train', 'test')
         self.split = split
         self.cfg = cfg
         self.force_no_aug = force_no_aug
         self.n_points = getattr(cfg, 'num_points', 2048)
+
+        # KD: optionally load teacher logits (only meaningful for train split)
+        self.teacher_logits = None
+        if teacher_logits_path and split == 'train':
+            if not os.path.exists(teacher_logits_path):
+                raise FileNotFoundError(
+                    f"Teacher logits not found: {teacher_logits_path}\n"
+                    f"Run: python train_dgcnn_teacher.py"
+                )
+            import torch as _torch
+            _kd = _torch.load(teacher_logits_path,
+                              map_location='cpu', weights_only=False)
+            self.teacher_logits = _kd['logits'].numpy().astype(np.float32)
 
         try:
             import h5py
@@ -121,6 +139,18 @@ class ScanObjectNNDataset(Dataset):
             # P0 FIX: Recompute geo from augmented slices so positional encoding
             # and SSP see the same geometry as the encoder.
             geo = np.stack([compute_geo(s) for s in slices])
+
+        # If we have teacher logits (training + KD), also return them.
+        # The teacher logits are indexed by sample idx directly since the
+        # teacher was run over the training set in dataset order.
+        if self.teacher_logits is not None:
+            teacher = self.teacher_logits[idx].copy()          # [num_classes]
+            return (
+                slices.astype(np.float32),  # [M, K, 6]
+                geo.astype(np.float32),     # [M, 8]
+                label,                      # int
+                teacher,                    # [num_classes] float32
+            )
 
         return (
             slices.astype(np.float32),  # [M, K, 6]

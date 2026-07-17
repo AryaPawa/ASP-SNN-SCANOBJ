@@ -45,9 +45,26 @@ def main():
     print(f"{'='*60}\n")
 
     # ── Datasets ──────────────────────────────────────────────────────
-    train_ds = ScanObjectNNDataset(cfg.data_dir, 'train', cfg)
+    # KD: if teacher_logits_path is set, the training dataset will return
+    # (slices, geo, label, teacher_logits) instead of the usual 3-tuple.
+    teacher_logits_path = getattr(cfg, 'teacher_logits_path', None)
+    if teacher_logits_path and os.path.exists(teacher_logits_path):
+        print(f"KD enabled: loading teacher logits from {teacher_logits_path}")
+        train_ds = ScanObjectNNDataset(
+            cfg.data_dir, 'train', cfg,
+            teacher_logits_path=teacher_logits_path,
+        )
+        use_kd = True
+    else:
+        train_ds = ScanObjectNNDataset(cfg.data_dir, 'train', cfg)
+        use_kd = False
+        if teacher_logits_path:
+            print(f"Warning: teacher_logits_path set but file missing "
+                  f"({teacher_logits_path}). KD disabled.")
+
     # P0 FIX: Validation must use UN-AUGMENTED data so val acc tracks test acc
-    val_ds_clean = ScanObjectNNDataset(cfg.data_dir, 'train', cfg, force_no_aug=True)
+    val_ds_clean = ScanObjectNNDataset(cfg.data_dir, 'train', cfg,
+                                       force_no_aug=True)
     test_ds = ScanObjectNNDataset(cfg.data_dir, 'test', cfg)
 
     val_frac = getattr(cfg, 'val_fraction', 0.1)
@@ -139,6 +156,15 @@ def main():
     print(f"Loss mode: {loss_mode}" +
           (f" (TET lambda={tet_lambda})" if loss_mode == 'tet' else ""))
 
+    # ── Knowledge distillation config ─────────────────────────────────
+    # KD is a training-only technique: teacher is never used at inference,
+    # so it has ZERO impact on system α or per-sample energy. Preserved
+    # as free accuracy gain on top of Tier 1 + Tier 2 efficiency claims.
+    kd_alpha = getattr(cfg, 'kd_alpha', 0.5)          # weight on KD vs CE
+    kd_temperature = getattr(cfg, 'kd_temperature', 4.0)  # softening T
+    if use_kd:
+        print(f"KD active: alpha={kd_alpha}, temperature={kd_temperature}")
+
     # ── Resume ────────────────────────────────────────────────────────
     start_epoch = 0
     best_val_acc = 0.0
@@ -171,7 +197,15 @@ def main():
         n_total_batches = len(train_loader)
         log_every = max(1, n_total_batches // 10)
 
-        for batch_idx, (slices, geo, labels) in enumerate(train_loader):
+        for batch_idx, batch_data in enumerate(train_loader):
+            # KD adds teacher_logits to the batch tuple
+            if use_kd:
+                slices, geo, labels, teacher_logits = batch_data
+                teacher_logits = teacher_logits.to(device, non_blocking=True)
+            else:
+                slices, geo, labels = batch_data
+                teacher_logits = None
+
             slices = slices.to(device, non_blocking=True)
             geo = geo.to(device, non_blocking=True)
             labels = labels.to(device, non_blocking=True)
@@ -191,7 +225,7 @@ def main():
                         criterion(logits_all[t], labels)
                         for t in range(T_actual)
                     ])
-                    loss = ce_terms.mean()
+                    ce_loss = ce_terms.mean()
 
                     # Optional regularization toward the final logits
                     if tet_lambda > 0 and T_actual > 1:
@@ -200,13 +234,38 @@ def main():
                             F.mse_loss(logits_all[t], final)
                             for t in range(T_actual - 1)
                         ]).mean()
-                        loss = loss + tet_lambda * mse
+                        ce_loss = ce_loss + tet_lambda * mse
                 else:
                     # Legacy: quadratic-ramp weighted sum, normalized
-                    loss = sum(
+                    ce_loss = sum(
                         aux_w[t] * criterion(logits_all[t], labels)
                         for t in range(min(T_actual, len(aux_w)))
                     ) / aux_w_sum
+
+                # ── KD term (training-time only, zero inference cost) ─
+                # Standard soft-target KD (Hinton et al. 2015):
+                #   L = (1 - alpha) * CE(student, hard) +
+                #       alpha * T^2 * KL(softmax(student/T) || softmax(teacher/T))
+                # For SNN with TET we apply the KD term to EVERY timestep's
+                # logits (matching the TET philosophy).
+                if use_kd and teacher_logits is not None:
+                    T_temp = kd_temperature
+                    # Teacher targets stay fixed (fp32) — soften them
+                    teacher_soft = F.softmax(teacher_logits.float() / T_temp, dim=-1)
+                    kd_terms = torch.stack([
+                        # student log-softmax at temperature T; upcast to fp32
+                        # so KL is numerically stable under AMP
+                        F.kl_div(
+                            F.log_softmax(logits_all[t].float() / T_temp, dim=-1),
+                            teacher_soft,
+                            reduction='batchmean',
+                        )
+                        for t in range(T_actual)
+                    ])
+                    kd_loss = kd_terms.mean() * (T_temp ** 2)
+                    loss = (1.0 - kd_alpha) * ce_loss + kd_alpha * kd_loss
+                else:
+                    loss = ce_loss
 
             optimizer.zero_grad()
             scaler.scale(loss).backward()
