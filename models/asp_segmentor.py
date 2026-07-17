@@ -123,6 +123,10 @@ class ASPSegmentor(nn.Module):
             feat_dim=cfg.feat_dim,
             k_edge=cfg.k_edge,
             in_channels=in_ch,
+            encoder_type=getattr(cfg, 'encoder_type', 'analog'),
+            T_enc=getattr(cfg, 'encoder_T', 4),
+            lif_leak=getattr(cfg, 'encoder_lif_leak', getattr(cfg, 'lif_leak', 0.9)),
+            lif_threshold=getattr(cfg, 'encoder_lif_threshold', getattr(cfg, 'lif_threshold', 1.0)),
         )
         self.pos_proj = nn.Linear(3, cfg.feat_dim, bias=False)
 
@@ -139,7 +143,6 @@ class ASPSegmentor(nn.Module):
             belief_dim=cfg.hidden_dim,
             geo_dim=cfg.geo_dim,
             d_ssp=cfg.d_ssp,
-            mode=getattr(cfg, 'ssp_mode', 'learned'),
         )
         self.belief_to_feat = nn.Linear(cfg.hidden_dim, cfg.feat_dim, bias=False)
         self.belief_norm    = nn.LayerNorm(cfg.hidden_dim)

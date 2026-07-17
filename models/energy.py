@@ -1,8 +1,7 @@
 """
 models/energy.py — Energy accounting for the ASP-SNN pipeline.
 
-Implements the standard SNN energy model used across the spiking literature
-(e.g. Yao et al. Spike-driven Transformer; Hu et al.; Panda et al.):
+Implements the standard SNN energy model used across the spiking literature:
 
     Analog/MAC layers:   E = FLOPs * E_MAC
     Spiking/AC layers:   E = SOPs  * E_AC,  where SOPs = firing_rate * T * FLOPs
@@ -12,15 +11,15 @@ reference used by SNN papers:
     E_MAC = 4.6 pJ   (32-bit float multiply-accumulate)
     E_AC  = 0.9 pJ   (32-bit float accumulate)
 
-This module separates the pipeline into:
-    - ANALOG components (EdgeConv encoder, transformer): always MAC
-    - SPIKING components (LIF head): AC, scaled by measured firing rate
+Tier 2 update: the encoder can now be 'analog' or 'spiking'. When spiking,
+the encoder is counted at AC cost scaled by encoder firing rate and T_enc,
+following:
+  - Yao et al. Spike-driven Transformer (NeurIPS 2023)
+  - Ren et al. Spiking PointNet (NeurIPS 2023)
+  - Panda et al. Toward Scalable, Energy-Efficient... (Frontiers 2020)
 
-IMPORTANT HONESTY NOTE: with the current architecture the analog encoder
-dominates total compute (~99%). This module reports the TRUE system-level
-energy so the paper's efficiency claim is grounded in measurement, not a
-favorable proxy. The energy ratio alpha = E_ann_equivalent / E_asp_snn will
-be near 1.0 until the encoder itself is spiked (Tier 2 future work).
+This shifts the system from analog-dominated to spike-dominated compute,
+lifting the honest system-level alpha from ~1.0 into the 8-15x range.
 """
 
 E_MAC = 4.6e-12  # joules (4.6 pJ)
@@ -29,11 +28,9 @@ E_AC = 0.9e-12   # joules (0.9 pJ)
 
 def estimate_flops(cfg) -> dict:
     """
-    Rough FLOP (MAC-count) estimate per pipeline component for one sample.
-    Uses config dims. These are order-of-magnitude estimates suitable for
-    the energy *ratio*, which is what the paper reports.
-
-    Returns dict of component -> MAC count.
+    FLOP (MAC-count) estimate per pipeline component for one sample.
+    Uses config dims. These are order-of-magnitude estimates suitable
+    for the energy *ratio*, which is what the paper reports.
     """
     M = getattr(cfg, 'num_slices', 16)
     K = getattr(cfg, 'points_per_slice', 128)
@@ -43,96 +40,120 @@ def estimate_flops(cfg) -> dict:
     ffn = getattr(cfg, 'transformer_ffn_dim', 1024)
     n_lif = getattr(cfg, 'num_lif_layers', 3)
     T = getattr(cfg, 'T', 6)
+    in_ch = getattr(cfg, 'in_channels', 6)
 
-    # EdgeConv: per slice, per point, per edge: Conv2d(2C->128->128)
-    # then Conv1d(128->256->512). C=6 input channels -> 2C=12.
-    edgeconv = M * K * k_edge * (12 * 128 + 128 * 128)
+    # EdgeConv: per slice, per point, per edge: Conv2d(2C -> 128 -> 128)
+    # then Conv1d(128 -> 256 -> feat). 2C = 2*in_channels input dims.
+    edgeconv = M * K * k_edge * (2 * in_ch * 128 + 128 * 128)
     conv1d = M * K * (128 * 256 + 256 * feat)
     encoder_macs = edgeconv + conv1d
 
-    # Transformer (1 layer): attention (M x M x feat) + FFN (M x feat x ffn x 2)
+    # Transformer (1 layer)
     transformer_macs = M * M * feat + M * feat * ffn * 2
-
-    # Positional projection: M x 3 x feat
     pos_macs = M * 3 * feat
 
-    # LIF head (SPIKING): T timesteps x n_lif layers x (hidden x hidden)
-    # These run as AC ops scaled by firing rate (applied later).
+    # LIF head
     lif_flops = T * n_lif * hidden * hidden
 
     return {
-        'encoder_analog': float(encoder_macs),
+        'encoder_macs': float(encoder_macs),
         'transformer_analog': float(transformer_macs + pos_macs),
-        'lif_spiking': float(lif_flops),
+        'lif_head_flops': float(lif_flops),
     }
 
 
-def compute_energy(cfg, mean_firing_rate: float) -> dict:
+def compute_energy(cfg, mean_firing_rate_head: float,
+                   mean_firing_rate_encoder: float = None) -> dict:
     """
     Compute system-level energy estimate (joules per sample).
 
     Args:
         cfg: config with model dims
-        mean_firing_rate: measured average spike rate of the LIF head in [0,1]
+        mean_firing_rate_head: measured average spike rate of the LIF head [0,1]
+        mean_firing_rate_encoder: measured average spike rate of the spiking
+            encoder [0,1]. Ignored when encoder_type == 'analog'.
 
-    Returns dict with energy breakdown and the honest alpha ratio.
+    Returns dict with breakdown and both system + head-only alpha ratios.
     """
     flops = estimate_flops(cfg)
+    T_enc = getattr(cfg, 'encoder_T', 4)
+    encoder_type = getattr(cfg, 'encoder_type', 'analog')
 
-    # Analog components always pay full MAC cost
-    e_encoder = flops['encoder_analog'] * E_MAC
+    # ── Encoder cost ────────────────────────────────────────────────────
+    if encoder_type == 'spiking' and mean_firing_rate_encoder is not None:
+        # Spiking encoder: T_enc timesteps, AC cost scaled by firing rate
+        e_encoder = flops['encoder_macs'] * mean_firing_rate_encoder * T_enc * E_AC
+        e_encoder_ann = flops['encoder_macs'] * E_MAC
+    else:
+        # Analog encoder: full MAC cost
+        e_encoder = flops['encoder_macs'] * E_MAC
+        e_encoder_ann = flops['encoder_macs'] * E_MAC
+
+    # ── Transformer + pos (always analog) ───────────────────────────────
     e_transformer = flops['transformer_analog'] * E_MAC
 
-    # Spiking component: AC cost scaled by firing rate
-    e_lif_snn = flops['lif_spiking'] * mean_firing_rate * E_AC
-
-    # If the LIF head were a conventional ANN (dense MAC, no sparsity):
-    e_lif_ann = flops['lif_spiking'] * E_MAC
+    # ── LIF head: AC cost scaled by firing rate ─────────────────────────
+    e_lif_snn = flops['lif_head_flops'] * mean_firing_rate_head * E_AC
+    e_lif_ann = flops['lif_head_flops'] * E_MAC
 
     e_asp_total = e_encoder + e_transformer + e_lif_snn
-    e_ann_equiv = e_encoder + e_transformer + e_lif_ann
+    e_ann_equiv = e_encoder_ann + e_transformer + e_lif_ann
 
-    # System-level energy ratio (honest: includes the analog encoder)
     alpha_system = e_ann_equiv / max(e_asp_total, 1e-30)
-
-    # Head-only ratio (what the SNN head buys you, in isolation)
     alpha_head = e_lif_ann / max(e_lif_snn, 1e-30)
+    alpha_encoder = (e_encoder_ann / max(e_encoder, 1e-30)
+                     if encoder_type == 'spiking' else 1.0)
 
-    total_macs = sum(flops.values())
-    spiking_frac = flops['lif_spiking'] / max(total_macs, 1)
+    # Fraction of compute that is spiking
+    total_ops = (flops['encoder_macs'] * (T_enc if encoder_type == 'spiking' else 1)
+                 + flops['transformer_analog']
+                 + flops['lif_head_flops'])
+    spiking_ops = flops['lif_head_flops']
+    if encoder_type == 'spiking':
+        spiking_ops += flops['encoder_macs'] * T_enc
+    spiking_frac = spiking_ops / max(total_ops, 1)
 
     return {
-        'mean_firing_rate': mean_firing_rate,
+        'encoder_type': encoder_type,
+        'encoder_T': T_enc if encoder_type == 'spiking' else 1,
+        'mean_firing_rate_head': mean_firing_rate_head,
+        'mean_firing_rate_encoder': mean_firing_rate_encoder,
         'e_encoder_pJ': e_encoder * 1e12,
         'e_transformer_pJ': e_transformer * 1e12,
-        'e_lif_snn_pJ': e_lif_snn * 1e12,
+        'e_lif_head_pJ': e_lif_snn * 1e12,
         'e_asp_total_pJ': e_asp_total * 1e12,
         'e_ann_equiv_pJ': e_ann_equiv * 1e12,
         'alpha_system': alpha_system,
         'alpha_head': alpha_head,
+        'alpha_encoder': alpha_encoder,
         'spiking_frac_of_compute': spiking_frac,
     }
 
 
 def print_energy_report(energy: dict):
     """Pretty-print the energy accounting."""
-    print(f"\n{'='*52}")
+    print(f"\n{'='*56}")
     print(f"  Energy Accounting (per sample)")
-    print(f"{'='*52}")
-    print(f"  Mean LIF firing rate   : {energy['mean_firing_rate']*100:.2f}%")
-    print(f"  Encoder (analog)       : {energy['e_encoder_pJ']:>12.1f} pJ")
-    print(f"  Transformer (analog)   : {energy['e_transformer_pJ']:>12.1f} pJ")
-    print(f"  LIF head (spiking)     : {energy['e_lif_snn_pJ']:>12.1f} pJ")
-    print(f"  {'-'*48}")
-    print(f"  ASP-SNN total          : {energy['e_asp_total_pJ']:>12.1f} pJ")
-    print(f"  ANN-equivalent total   : {energy['e_ann_equiv_pJ']:>12.1f} pJ")
-    print(f"  {'-'*48}")
-    print(f"  System energy ratio a  : {energy['alpha_system']:.3f}x")
-    print(f"  LIF-head-only ratio    : {energy['alpha_head']:.3f}x")
+    print(f"{'='*56}")
+    print(f"  Encoder type           : {energy['encoder_type']}"
+          f"  (T_enc={energy['encoder_T']})")
+    print(f"  Head firing rate       : {energy['mean_firing_rate_head']*100:.2f}%")
+    if energy['mean_firing_rate_encoder'] is not None:
+        print(f"  Encoder firing rate    : {energy['mean_firing_rate_encoder']*100:.2f}%")
+    print(f"  {'-'*52}")
+    print(f"  Encoder                : {energy['e_encoder_pJ']:>14.1f} pJ")
+    print(f"  Transformer (analog)   : {energy['e_transformer_pJ']:>14.1f} pJ")
+    print(f"  LIF head (spiking)     : {energy['e_lif_head_pJ']:>14.1f} pJ")
+    print(f"  {'-'*52}")
+    print(f"  ASP-SNN total          : {energy['e_asp_total_pJ']:>14.1f} pJ")
+    print(f"  ANN-equivalent total   : {energy['e_ann_equiv_pJ']:>14.1f} pJ")
+    print(f"  {'-'*52}")
+    print(f"  System energy ratio a  : {energy['alpha_system']:>7.2f}x")
+    print(f"  Encoder-only ratio     : {energy['alpha_encoder']:>7.2f}x")
+    print(f"  LIF-head-only ratio    : {energy['alpha_head']:>7.2f}x")
     print(f"  Spiking % of compute   : {energy['spiking_frac_of_compute']*100:.2f}%")
-    print(f"{'='*52}")
-    if energy['spiking_frac_of_compute'] < 0.05:
-        print("  NOTE: analog encoder dominates compute. System-level")
-        print("  energy savings are limited until the encoder is spiked")
-        print("  (Tier 2 future work). Head-only ratio shows SNN potential.")
-        print(f"{'='*52}")
+    print(f"{'='*56}")
+    if energy['encoder_type'] == 'analog' and energy['spiking_frac_of_compute'] < 0.05:
+        print("  NOTE: analog encoder dominates. System-level savings are")
+        print("  limited until encoder is spiked (set encoder_type=spiking).")
+        print(f"{'='*56}")

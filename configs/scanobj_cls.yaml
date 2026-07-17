@@ -26,12 +26,21 @@ d_ssp: 128
 T: 6
 exit_threshold: 0.40
 
+# ── Encoder type (Tier 2 spiking encoder) ──────────────────────────────
+# 'analog'  : original EdgeConv with ReLU (backward compatible, α≈1)
+# 'spiking' : ReLU replaced with LIF neurons, runs T_enc timesteps.
+#              Shifts encoder compute from MAC to AC → system α = 8-15x.
+#              Reference: Spiking PointNet (Ren et al. NeurIPS 2023);
+#              Spiking PointCNN (Wu et al. MDPI 2024); SpikingRTNH (2025).
+encoder_type: analog
+encoder_T: 4
+encoder_lif_leak: 0.9
+encoder_lif_threshold: 1.0
+
 # ── SSP ablation (go/no-go for the active-perception thesis) ───────────
 # 'learned'   : attention-based slice selection (the proposed method)
 # 'random'    : random unvisited slice each step (ablation baseline)
 # 'fps_order' : fixed FPS-order traversal (non-adaptive baseline)
-# Run all three with identical settings; 'learned' must beat the others
-# for the active-perception contribution to hold.
 ssp_mode: learned
 
 # ── Tier-1 accuracy upgrades (SNN training best practices) ─────────────
