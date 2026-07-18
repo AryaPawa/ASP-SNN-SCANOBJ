@@ -1,5 +1,6 @@
 # configs/shapenet_seg.yaml — ShapeNetPart part segmentation
-# Batch 3 target: 86.0 – 86.8 Instance mIoU (competitive with SPM / MambaTron)
+# Batch 4 target: 85.5 – 86.5 Ins mIoU with system-level α starting to move.
+# Roadmap goal (all batches): 86.0 – 86.8 Ins mIoU with α ≥ 5x.
 
 # ── Dataset ────────────────────────────────────────────────────────────
 dataset: shapenet
@@ -9,17 +10,12 @@ num_classes: 50
 num_categories: 16
 use_category: true
 
-# ── Slicing — Coarse (drives the ASP loop) ─────────────────────────────
+# ── Slicing — Coarse ───────────────────────────────────────────────────
 num_slices: 16
 points_per_slice: 128
 geo_dim: 8
 
-# ── B4: Slicing — Fine (per-point local features only) ─────────────────
-# The fine level is NOT visited by the ASP loop. It only produces
-# per-slice tokens whose features are propagated to each point via A1's
-# inverse-distance interpolation, then concatenated to the coarse per-point
-# features in the seg head. Cost is bounded because we do one encoder pass
-# and no ASP loop over fine slices.
+# ── B4: Slicing — Fine ─────────────────────────────────────────────────
 use_multiscale: true
 num_slices_fine: 64
 points_per_slice_fine: 32
@@ -39,11 +35,23 @@ d_ssp: 128
 T: 6
 point_feat_dim: 64
 
-# ── Encoder type (kept analog through Batch 3; Batch 4 will spike this) ─
+# ── Encoder type (kept analog until final batch) ───────────────────────
 encoder_type: analog
 encoder_T: 4
 encoder_lif_leak: 0.9
 encoder_lif_threshold: 1.0
+
+# ── B2 (Batch 4): Segmentation head type ───────────────────────────────
+# 'spiking' (new default) — SpikingSegmentationHead (Batch 4). Three LIF
+#            cells run for T=seg_head_T timesteps with static-input encoding.
+#            Spike-only inter-layer communication. Final analog classifier
+#            reads out the average membrane of the last cell. This is the
+#            change that lets system α actually move for segmentation.
+# 'analog'  — original Batch 3 seg head (Linear+BN+ReLU). Ablation only.
+seg_head_type: spiking
+seg_head_T: 2                    # 2 timesteps is the sweet spot for accuracy/energy
+seg_head_lif_leak: 0.9
+seg_head_lif_threshold: 1.0
 
 # ── SSP ablation ───────────────────────────────────────────────────────
 ssp_mode: learned
@@ -65,28 +73,24 @@ fp_k: 3
 fp_epsilon: 1e-8
 
 # ── B1 (Batch 3): Boundary-Aware ASP ───────────────────────────────────
-# When true, a small BoundaryHead predicts b(p) ∈ [0,1] per point (BCE
-# supervised via bnd_labels from the dataset). The SSP receives per-slice
-# mean boundary scores and adds a learned bias to its selection scores,
-# tilting the ASP loop toward slices with many boundary points.
-#
-# The SSP's boundary_weight is zero-initialised so this is a NO-OP at t=0
-# — training gradually grows the bias if predicted boundaries help seg loss.
-#
-# When false: no boundary head, no bias term, SSP behaves as in Batch 2.
 use_boundary_aware: true
-boundary_hidden: 128       # BoundaryHead width (~70K params)
-bnd_k: 10                  # k-NN size for computing ground-truth boundary labels
-bnd_loss_weight: 0.1       # weight of BCE loss in total loss
+boundary_hidden: 128
+bnd_k: 10
+bnd_loss_weight: 0.1
 
 # ── Training ───────────────────────────────────────────────────────────
+# NOTE for Batch 4: with spiking seg head + dense TET, the head runs
+# T * seg_head_T = 12 spiking forward passes per training step. This
+# raises per-step wall-clock by ~1.2x relative to Batch 3. Total training
+# time is still bounded, but consider raising warmup to 15 epochs so the
+# spiking head has time to settle before cosine decay bites in.
 epochs: 300
 batch_size: 32
 lr: 3e-4
 encoder_lr_scale: 0.1
 weight_decay: 0.01
 grad_clip: 1.0
-warmup_epochs: 10
+warmup_epochs: 15                # 10 → 15 (spiking head warm-up)
 use_amp: true
 
 # ── Gumbel temperature ─────────────────────────────────────────────────
