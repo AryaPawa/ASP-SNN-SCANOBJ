@@ -1,38 +1,26 @@
 """
 models/ssp.py — Slice Selection Policy with ablation modes.
 
-Scores unvisited slices so the ASP loop can pick which slice to examine next.
-
-Modes (set via cfg.ssp_mode, passed to __init__):
+Modes (set via cfg.ssp_mode):
     'learned'   — attention-based scoring between LIF belief state and
                   per-slice geometry descriptors (the proposed method).
-    'random'    — assign random scores to unvisited slices. The go/no-go
-                  ablation baseline: if this matches 'learned', the active
-                  perception thesis does not hold.
-    'fps_order' — score slices by their FPS order (descending), i.e. always
-                  walk slices in the deterministic FPS sequence. Tests whether
-                  the learned policy beats a fixed, non-adaptive ordering.
+    'random'    — assign random scores to unvisited slices. Go/no-go
+                  ablation baseline.
+    'fps_order' — score slices by their FPS order (descending). Tests
+                  whether the learned policy beats a fixed ordering.
 
-Category conditioning (A3 — Batch 1):
-    When num_categories > 0 (ShapeNetPart), a learned category embedding is
-    injected into the "key" projection so the SSP has a category-specific
-    traversal prior from t=0. Adds ~1K parameters.
+Category conditioning (A3, Batch 1):
+    num_categories > 0 → learned category embedding added to the key.
 
-    Why this helps: for ShapeNetPart the category is known at input time.
-    Without conditioning, the SSP burns early timesteps rediscovering "am I
-    a chair or a lamp?" before it can specialize its traversal.
-    With conditioning, the SSP can immediately learn category-specific
-    policies (e.g. "for chairs, backrest first; for motorbikes, wheels first").
+Boundary bias (B1, Batch 3):
+    boundary_scores > 0 → learned scalar `boundary_weight` used to bias
+    SSP scoring toward slices with high predicted-boundary probability.
+    Weight is zero-initialised so training smoothly grows the bias
+    only if boundary predictions become useful. When boundary head is
+    off or its scores are None, SSP behaves identically to Batch 2.
 
-    When num_categories = 0 (ScanObjectNN classification, S3DIS scene seg),
-    this branch is fully disabled — no extra parameters, exact backward
-    compatibility with the original SSP.
-
-    Reference: Mnih et al., Recurrent Models of Visual Attention (NeurIPS 2014)
-    — precedent for conditioning attention on task metadata.
-
-All modes mask visited entries to -1e9 (finite, not -inf) so Gumbel-softmax
-and argmax stay numerically stable even when all slices are visited (T >= M).
+Reference: Mnih et al., Recurrent Models of Visual Attention, NeurIPS 2014
+(conditioning attention on task metadata & downstream signals).
 """
 
 import torch
@@ -44,49 +32,55 @@ class SSP(nn.Module):
 
     def __init__(self, belief_dim: int, geo_dim: int = 8,
                  d_ssp: int = 128, mode: str = 'learned',
-                 num_categories: int = 0, cat_emb_dim: int = 8):
+                 num_categories: int = 0, cat_emb_dim: int = 8,
+                 use_boundary_bias: bool = False):
         super().__init__()
         assert mode in ('learned', 'random', 'fps_order'), \
             f"Unknown ssp_mode: {mode}"
         self.mode = mode
 
-        # Projections are always created (so checkpoints are compatible across
-        # modes), but only used when mode == 'learned'.
         self.key_proj   = nn.Linear(belief_dim, d_ssp, bias=False)
         self.query_proj = nn.Linear(geo_dim, d_ssp, bias=False)
         self.scale      = d_ssp ** -0.5
 
-        # ── Category-conditional SSP (A3) ──────────────────────────────
-        # When enabled, a learned category embedding is added to the key so the
-        # SSP knows the object class from t=0. Only used for datasets with
-        # category labels (ShapeNetPart). Fully disabled when num_categories=0
-        # (ScanObjectNN, S3DIS).
+        # ── A3 (Batch 1): Category conditioning ────────────────────────
         self.num_categories = num_categories
         if num_categories > 0:
             self.cat_emb      = nn.Embedding(num_categories, cat_emb_dim)
             self.cat_key_proj = nn.Linear(cat_emb_dim, d_ssp, bias=False)
-            # Small init so category signal starts as a gentle perturbation
-            # on top of the belief-driven key, then grows as needed.
             nn.init.normal_(self.cat_emb.weight, std=0.02)
             nn.init.zeros_(self.cat_key_proj.weight)
         else:
             self.cat_emb      = None
             self.cat_key_proj = None
 
+        # ── B1 (Batch 3): Boundary bias ───────────────────────────────
+        # boundary_weight is zero-initialised so early training (when the
+        # boundary head is still noise) doesn't corrupt SSP decisions.
+        # As the boundary head learns to predict boundaries, training
+        # naturally grows this weight if the bias improves seg loss.
+        self.use_boundary_bias = use_boundary_bias
+        if use_boundary_bias:
+            self.boundary_weight = nn.Parameter(torch.tensor(0.0))
+        else:
+            self.boundary_weight = None
+
     def forward(
         self,
-        belief:   torch.Tensor,           # [B, hidden_dim]
-        geo:      torch.Tensor,           # [B, M, geo_dim]
-        vis_mask: torch.Tensor,           # [B, M]  bool — True = visited
-        cat_ids:  torch.Tensor = None,    # [B]  optional — category ids
+        belief:          torch.Tensor,           # [B, hidden_dim]
+        geo:             torch.Tensor,           # [B, M, geo_dim]
+        vis_mask:        torch.Tensor,           # [B, M]  bool
+        cat_ids:         torch.Tensor = None,    # [B]  optional
+        boundary_scores: torch.Tensor = None,    # [B, M]  optional (B1)
     ) -> torch.Tensor:
         """
         Args:
-            belief   : LIF belief state (or zeros at t=0)
-            geo      : per-slice geometry descriptors
-            vis_mask : True at slices already visited by the ASP loop
-            cat_ids  : optional per-sample category ids (ShapeNetPart only).
-                       Ignored when num_categories was 0 at construction.
+            belief          : LIF belief state
+            geo             : per-slice geometry descriptors
+            vis_mask        : True at visited slices
+            cat_ids         : category ids for A3 (ShapeNetPart)
+            boundary_scores : per-slice mean boundary probability [0,1] for B1.
+                              Ignored when use_boundary_bias was False.
 
         Returns:
             scores: [B, M] with visited entries masked to -1e9.
@@ -97,9 +91,7 @@ class SSP(nn.Module):
         if self.mode == 'learned':
             key = self.key_proj(belief)                              # [B, d_ssp]
 
-            # Category-conditional key augmentation (A3).
-            # If category embeddings weren't created OR no cat_ids supplied,
-            # this branch is a no-op — behavior identical to original SSP.
+            # A3: category augmentation of the key
             if self.cat_emb is not None and cat_ids is not None:
                 cat_key = self.cat_key_proj(self.cat_emb(cat_ids.long()))
                 key = key + cat_key                                  # [B, d_ssp]
@@ -107,15 +99,16 @@ class SSP(nn.Module):
             query  = self.query_proj(geo)                             # [B, M, d_ssp]
             scores = (query * key.unsqueeze(1)).sum(-1) * self.scale  # [B, M]
 
+            # B1: additive boundary bias. Bias grows/shrinks via training
+            # depending on whether the boundary signal helps seg loss.
+            if self.boundary_weight is not None and boundary_scores is not None:
+                scores = scores + self.boundary_weight * boundary_scores
+
         elif self.mode == 'random':
-            # Fresh random scores each timestep — no learning signal.
             scores = torch.rand(B, M, device=device)
 
         else:  # 'fps_order'
-            # geo[:, :, 6] is max_dist, the key used to sort slices into FPS
-            # order upstream. Here slices arrive already in that sorted order,
-            # so a simple descending ramp picks them sequentially.
-            ramp = torch.linspace(1.0, 0.0, M, device=device)        # [M]
-            scores = ramp.unsqueeze(0).expand(B, M).contiguous()     # [B, M]
+            ramp = torch.linspace(1.0, 0.0, M, device=device)
+            scores = ramp.unsqueeze(0).expand(B, M).contiguous()
 
         return scores.masked_fill(vis_mask, -1e9)

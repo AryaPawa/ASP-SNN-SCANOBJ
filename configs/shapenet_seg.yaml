@@ -1,6 +1,5 @@
 # configs/shapenet_seg.yaml — ShapeNetPart part segmentation
-# Batch 2 target: 85.5 – 86.5 Instance mIoU
-# Roadmap goal (through all batches): 86.0 – 86.8 Instance mIoU
+# Batch 3 target: 86.0 – 86.8 Instance mIoU (competitive with SPM / MambaTron)
 
 # ── Dataset ────────────────────────────────────────────────────────────
 dataset: shapenet
@@ -10,12 +9,24 @@ num_classes: 50
 num_categories: 16
 use_category: true
 
-# ── Slicing ────────────────────────────────────────────────────────────
+# ── Slicing — Coarse (drives the ASP loop) ─────────────────────────────
 num_slices: 16
 points_per_slice: 128
 geo_dim: 8
 
-# ── Model ──────────────────────────────────────────────────────────────
+# ── B4: Slicing — Fine (per-point local features only) ─────────────────
+# The fine level is NOT visited by the ASP loop. It only produces
+# per-slice tokens whose features are propagated to each point via A1's
+# inverse-distance interpolation, then concatenated to the coarse per-point
+# features in the seg head. Cost is bounded because we do one encoder pass
+# and no ASP loop over fine slices.
+use_multiscale: true
+num_slices_fine: 64
+points_per_slice_fine: 32
+fine_feat_dim: 128
+fine_k_edge: 8
+
+# ── Model — Coarse ─────────────────────────────────────────────────────
 feat_dim: 512
 k_edge: 20
 transformer_heads: 4
@@ -28,7 +39,7 @@ d_ssp: 128
 T: 6
 point_feat_dim: 64
 
-# ── Encoder type (kept analog for Batch 2; Batch 3 will spike this) ────
+# ── Encoder type (kept analog through Batch 3; Batch 4 will spike this) ─
 encoder_type: analog
 encoder_T: 4
 encoder_lif_leak: 0.9
@@ -45,28 +56,28 @@ lif_learnable: true
 lif_use_mpbn: true
 
 # ── A0 (Batch 2): Dense TET loss ───────────────────────────────────────
-# 'ce'         : single CE on final logits (backward-compat / Batch 1)
-# 'dense_tet'  : mean per-timestep per-point CE with equal weighting.
-#                Forces the seg head + belief pathway to be discriminative
-#                at every ASP timestep. Ref: Deng et al. TET ICLR 2022.
-#                Cost: seg head runs T times during training only. Eval is
-#                a single forward pass (no per-timestep cost).
 loss_mode: dense_tet
-
-# Optional MSE regularizer pulling each intermediate timestep's logits
-# toward the final-step logits. Small value stabilizes training. Set 0 to
-# disable. In classifier this was 0.05 (same value shown to work).
 tet_lambda: 0.05
 
 # ── A1 (Batch 2): Soft feature propagation ─────────────────────────────
-# When true, per-point local features are computed as an inverse-distance
-# weighted mixture of the fp_k nearest slice anchor features (PointNet++
-# style). This fixes the "all ~128 points in a slice share one 512-d
-# vector" resolution collapse. When false, falls back to hard slice
-# lookup (matches Batch 1 behaviour) — useful for A/B ablation.
 use_soft_fp: true
-fp_k: 3            # 3 nearest anchors is standard for PointNet++ F.P.
-fp_epsilon: 1e-8   # numerical stability for 1/distance
+fp_k: 3
+fp_epsilon: 1e-8
+
+# ── B1 (Batch 3): Boundary-Aware ASP ───────────────────────────────────
+# When true, a small BoundaryHead predicts b(p) ∈ [0,1] per point (BCE
+# supervised via bnd_labels from the dataset). The SSP receives per-slice
+# mean boundary scores and adds a learned bias to its selection scores,
+# tilting the ASP loop toward slices with many boundary points.
+#
+# The SSP's boundary_weight is zero-initialised so this is a NO-OP at t=0
+# — training gradually grows the bias if predicted boundaries help seg loss.
+#
+# When false: no boundary head, no bias term, SSP behaves as in Batch 2.
+use_boundary_aware: true
+boundary_hidden: 128       # BoundaryHead width (~70K params)
+bnd_k: 10                  # k-NN size for computing ground-truth boundary labels
+bnd_loss_weight: 0.1       # weight of BCE loss in total loss
 
 # ── Training ───────────────────────────────────────────────────────────
 epochs: 300
@@ -99,11 +110,6 @@ aug_jitter_clip: 0.02
 aug_flip_x: true
 aug_flip_y: true
 aug_flip_z: false
-
-# Still off pending dataset-loader integration (see Batch 1 note)
-aug_resample: false
-
-aug_slice_dropout: 0.1
 
 # ── Logging ────────────────────────────────────────────────────────────
 eval_interval: 5

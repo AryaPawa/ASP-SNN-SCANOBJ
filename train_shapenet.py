@@ -1,16 +1,11 @@
 """
 train_shapenet.py — Train ASP-SNN on ShapeNetPart part segmentation.
 
-Usage:
-    python train_shapenet.py [--config configs/shapenet_seg.yaml] [--resume ckpt.pt]
-
-Batch 2 upgrade (A0):
-    Adds cfg.loss_mode == 'dense_tet' — mean of per-timestep per-point CE
-    losses using the per-timestep logits returned by the segmentor. Analog
-    of Deng et al. TET (ICLR 2022) for dense prediction. Optional MSE
-    regularizer toward final-step logits controlled by cfg.tet_lambda.
-    When loss_mode is anything else (e.g. 'ce', 'aux'), the behaviour is
-    the same as Batch 1: single CE on the final part_logits.
+Batch 3 upgrades:
+    Handles the new 10-tuple dataloader (coarse + fine slicing + boundary
+    labels). Adds a small BCE loss on the boundary head's per-point
+    predictions, weighted by cfg.bnd_loss_weight (default 0.1).
+    Total loss = seg_loss + bnd_loss_weight * boundary_BCE.
 """
 
 import math
@@ -35,16 +30,8 @@ from models.asp_segmentor import ASPSegmentor
 
 # ── Loss helpers ──────────────────────────────────────────────────────────
 
-def _make_valid_mask(cat_ids: torch.Tensor, num_parts: int,
-                     device: torch.device) -> torch.Tensor:
-    """
-    Build the per-batch [B, P] boolean mask indicating which part labels
-    are valid for each shape's category. Precomputed once per batch and
-    reused across all T per-timestep loss evaluations (Batch 2 speedup).
-    """
+def _make_valid_mask(cat_ids, num_parts, device):
     B = cat_ids.shape[0]
-    # P1 FIX (kept): pre-fetch cat_ids to CPU once instead of .item() inside
-    # the inner loop (which forces B CPU syncs per forward pass).
     cat_ids_cpu = cat_ids.detach().cpu().tolist()
     valid_mask = torch.zeros(B, num_parts, device=device, dtype=torch.bool)
     for b in range(B):
@@ -53,14 +40,7 @@ def _make_valid_mask(cat_ids: torch.Tensor, num_parts: int,
     return valid_mask
 
 
-def _seg_ce_from_mask(part_logits: torch.Tensor,
-                      part_labels: torch.Tensor,
-                      valid_mask:  torch.Tensor) -> torch.Tensor:
-    """
-    Category-aware masked CE for one timestep.
-    Invalid part logits masked to -1e9 in fp32 (NOT fp16 — avoids overflow).
-    No label_smoothing (incompatible with -1e9 masking).
-    """
+def _seg_ce_from_mask(part_logits, part_labels, valid_mask):
     B, N, P = part_logits.shape
     mask_expanded = valid_mask.unsqueeze(1).expand(B, N, P)
     logits_masked = part_logits.float().clone()
@@ -72,34 +52,15 @@ def _seg_ce_from_mask(part_logits: torch.Tensor,
 
 
 def seg_loss_fn(part_logits, part_labels, cat_ids):
-    """
-    Legacy single-timestep CE loss. Kept for backward compatibility with
-    Batch 1 configs (loss_mode='ce' or 'aux').
-    """
+    """Legacy single-timestep CE (kept for backward compat)."""
     valid_mask = _make_valid_mask(cat_ids, part_logits.shape[-1],
                                   part_logits.device)
     return _seg_ce_from_mask(part_logits, part_labels, valid_mask)
 
 
-def compute_seg_loss(part_logits: torch.Tensor,
-                     per_timestep_logits,
-                     part_labels: torch.Tensor,
-                     cat_ids:     torch.Tensor,
-                     loss_mode:   str = 'ce',
-                     tet_lambda:  float = 0.0) -> torch.Tensor:
-    """
-    Router that picks between legacy CE (single tensor) and dense TET
-    (per-timestep list) based on loss_mode. Precomputes the valid_mask
-    once and reuses it across timesteps for speed.
-
-    Args:
-        part_logits         : [B, N, P] — final logits (always required)
-        per_timestep_logits : list of [B, N, P] or None
-        part_labels         : [B, N]
-        cat_ids             : [B]
-        loss_mode           : 'ce' | 'dense_tet' (Batch 2)
-        tet_lambda          : MSE regularizer weight toward final logits
-    """
+def compute_seg_loss(part_logits, per_timestep_logits, part_labels, cat_ids,
+                     loss_mode='ce', tet_lambda=0.0):
+    """Router: legacy CE vs. dense TET."""
     device     = part_logits.device
     num_parts  = part_logits.shape[-1]
     valid_mask = _make_valid_mask(cat_ids, num_parts, device)
@@ -109,15 +70,12 @@ def compute_seg_loss(part_logits: torch.Tensor,
                  and len(per_timestep_logits) > 0)
 
     if use_dense:
-        # Equal-weighted mean of per-timestep CE (TET, Deng et al. ICLR 2022)
         ce_terms = torch.stack([
             _seg_ce_from_mask(lt, part_labels, valid_mask)
             for lt in per_timestep_logits
         ])
         loss = ce_terms.mean()
 
-        # Optional MSE regularizer pulling each intermediate step toward
-        # the final-step logits (stabilizes training).
         if tet_lambda > 0 and len(per_timestep_logits) > 1:
             final = per_timestep_logits[-1].detach()
             mse_terms = torch.stack([
@@ -127,8 +85,37 @@ def compute_seg_loss(part_logits: torch.Tensor,
             loss = loss + tet_lambda * mse_terms.mean()
         return loss
 
-    # Legacy fall-through
     return _seg_ce_from_mask(part_logits, part_labels, valid_mask)
+
+
+def compute_boundary_loss(bnd_logits: torch.Tensor,
+                          bnd_labels: torch.Tensor,
+                          pos_weight: float = None) -> torch.Tensor:
+    """
+    B1 — BCE loss on the per-point boundary head.
+
+    Boundary labels are typically imbalanced (interior >> boundary), so
+    an optional pos_weight helps. When pos_weight is None we compute it
+    per-batch as (num_negatives / num_positives), clipped to a max value.
+    """
+    B, N = bnd_logits.shape
+    # If the head is disabled, just return zero (no gradient).
+    if bnd_logits is None:
+        return torch.zeros((), device=bnd_labels.device)
+
+    # Per-batch pos_weight (skip if user pre-supplied one)
+    if pos_weight is None:
+        num_pos = bnd_labels.sum().clamp(min=1.0)
+        num_neg = (bnd_labels.numel() - num_pos).clamp(min=1.0)
+        pw = (num_neg / num_pos).clamp(max=20.0)
+    else:
+        pw = torch.tensor(float(pos_weight), device=bnd_logits.device)
+
+    return F.binary_cross_entropy_with_logits(
+        bnd_logits.reshape(-1),
+        bnd_labels.reshape(-1),
+        pos_weight=pw,
+    )
 
 
 # ── mIoU ──────────────────────────────────────────────────────────────────
@@ -194,38 +181,40 @@ def main():
 
     # ── Datasets ──────────────────────────────────────────────────────
     train_ds = ShapeNetPartDataset(cfg.data_dir, 'train', cfg)
-    test_ds = ShapeNetPartDataset(cfg.data_dir, 'test', cfg)
+    test_ds  = ShapeNetPartDataset(cfg.data_dir, 'test',  cfg)
 
-    pw = cfg.num_workers > 0
+    pw_ = cfg.num_workers > 0
     drop_last = len(train_ds) >= cfg.batch_size * 2
     train_loader = DataLoader(
         train_ds, batch_size=cfg.batch_size, shuffle=True,
         num_workers=cfg.num_workers, pin_memory=True,
-        drop_last=drop_last, persistent_workers=pw,
+        drop_last=drop_last, persistent_workers=pw_,
     )
     test_loader = DataLoader(
         test_ds, batch_size=cfg.batch_size, shuffle=False,
         num_workers=cfg.num_workers, pin_memory=True,
-        persistent_workers=pw,
+        persistent_workers=pw_,
     )
 
     # ── Model ─────────────────────────────────────────────────────────
-    cfg.num_classes = NUM_PARTS
+    cfg.num_classes    = NUM_PARTS
     cfg.num_categories = NUM_CATEGORIES
-    cfg.use_category = True
-    cfg.in_channels = 6
+    cfg.use_category   = True
+    cfg.in_channels    = 6
 
     model = ASPSegmentor(cfg).to(device)
     n_params = sum(p.numel() for p in model.parameters())
     print(f"Parameters: {n_params:,}")
 
-    # ── Loss mode (Batch 2 A0) ────────────────────────────────────────
-    loss_mode  = getattr(cfg, 'loss_mode', 'ce')
-    tet_lambda = getattr(cfg, 'tet_lambda', 0.0)
+    # ── Loss config ───────────────────────────────────────────────────
+    loss_mode        = getattr(cfg, 'loss_mode', 'ce')
+    tet_lambda       = getattr(cfg, 'tet_lambda', 0.0)
+    bnd_loss_weight  = getattr(cfg, 'bnd_loss_weight', 0.1)
+    use_bnd          = getattr(cfg, 'use_boundary_aware', True)
     print(f"Loss mode: {loss_mode}" +
           (f" (TET lambda={tet_lambda})" if loss_mode == 'dense_tet' else ""))
-    if loss_mode == 'dense_tet':
-        print(f"  Per-timestep seg head will run T={cfg.T} times during training.")
+    if use_bnd:
+        print(f"Boundary BCE weight: {bnd_loss_weight}")
 
     # ── Optimizer with differential LR ────────────────────────────────
     enc_scale = getattr(cfg, 'encoder_lr_scale', 0.1)
@@ -234,12 +223,18 @@ def main():
         list(model.slice_transformer.parameters()) +
         list(model.pos_proj.parameters())
     )
-    enc_ids = set(id(p) for p in encoder_params)
+    # B4: Fine encoder also gets the encoder LR scale
+    if model.fine_encoder is not None:
+        encoder_params += list(model.fine_encoder.parameters())
+    if model.fine_pos_proj is not None:
+        encoder_params += list(model.fine_pos_proj.parameters())
+
+    enc_ids    = set(id(p) for p in encoder_params)
     new_params = [p for p in model.parameters() if id(p) not in enc_ids]
 
     optimizer = torch.optim.AdamW([
         {"params": encoder_params, "lr": cfg.lr * enc_scale},
-        {"params": new_params, "lr": cfg.lr},
+        {"params": new_params,     "lr": cfg.lr},
     ], weight_decay=cfg.weight_decay)
 
     def lr_lambda(epoch):
@@ -257,8 +252,7 @@ def main():
     best_inst_iou = 0.0
     if args.resume and os.path.exists(args.resume):
         ckpt = torch.load(args.resume, map_location=device, weights_only=False)
-        # strict=False so Batch 1 checkpoints can be resumed (they don't
-        # contain the new belief_to_seg_global weight added in Batch 2).
+        # strict=False so earlier-batch checkpoints can be resumed cleanly.
         missing, unexpected = model.load_state_dict(ckpt['model'], strict=False)
         if missing:
             print(f"  [resume] missing keys (initialized fresh): {missing}")
@@ -284,35 +278,51 @@ def main():
         tau = max(cfg.tau_end, cfg.tau_start * (cfg.tau_decay ** epoch))
         model.gumbel_tau.fill_(tau)
 
-        # ── Train ─────────────────────────────────────────────────────
         model.train()
         total_loss = n_batches = 0
         n_total_batches = len(train_loader)
         log_every = max(1, n_total_batches // 10)
 
-        for batch_idx, (slices, geo, pts_xyz, sid_arr, part_labels, cat_ids) \
-                in enumerate(train_loader):
-            slices = slices.to(device, non_blocking=True)
-            geo = geo.to(device, non_blocking=True)
-            pts_xyz = pts_xyz.to(device, non_blocking=True)
-            sid_arr = sid_arr.to(device, non_blocking=True)
-            part_labels = part_labels.to(device, non_blocking=True)
-            cat_ids = cat_ids.to(device, non_blocking=True)
+        # Batch 3: dataset yields 10 items
+        for batch_idx, batch in enumerate(train_loader):
+            (coarse_slices, coarse_geo, pts_xyz, coarse_sid_arr,
+             fine_slices,   fine_geo,   fine_sid_arr,
+             part_labels, bnd_labels, cat_ids) = batch
+
+            coarse_slices   = coarse_slices.to(device,   non_blocking=True)
+            coarse_geo      = coarse_geo.to(device,      non_blocking=True)
+            pts_xyz         = pts_xyz.to(device,         non_blocking=True)
+            coarse_sid_arr  = coarse_sid_arr.to(device,  non_blocking=True)
+            fine_slices     = fine_slices.to(device,     non_blocking=True)
+            fine_geo        = fine_geo.to(device,        non_blocking=True)
+            fine_sid_arr    = fine_sid_arr.to(device,    non_blocking=True)
+            part_labels     = part_labels.to(device,     non_blocking=True)
+            bnd_labels      = bnd_labels.to(device,      non_blocking=True)
+            cat_ids         = cat_ids.to(device,         non_blocking=True)
 
             with autocast(device_type=device.type, enabled=cfg.use_amp):
-                # Batch 2: model returns (part_logits, aux) where
-                # aux['per_timestep_logits'] is populated when dense_tet is on.
                 part_logits, aux = model(
-                    slices, geo, sid_arr, cat_ids, pts_xyz, training=True
+                    coarse_slices, coarse_geo, coarse_sid_arr,
+                    cat_ids, pts_xyz,
+                    fine_slices=fine_slices,
+                    fine_geo=fine_geo,
+                    fine_sid_arr=fine_sid_arr,
+                    training=True,
                 )
-                per_t = aux.get('per_timestep_logits', None) if isinstance(aux, dict) else None
+                per_t     = aux.get('per_timestep_logits', None)
+                bnd_logts = aux.get('bnd_logits', None)
 
-                loss = compute_seg_loss(
-                    part_logits, per_t,
-                    part_labels, cat_ids,
-                    loss_mode=loss_mode,
-                    tet_lambda=tet_lambda,
+                seg_loss = compute_seg_loss(
+                    part_logits, per_t, part_labels, cat_ids,
+                    loss_mode=loss_mode, tet_lambda=tet_lambda,
                 )
+
+                # B1: boundary BCE loss (only if boundary head active)
+                if use_bnd and bnd_logts is not None:
+                    bnd_loss = compute_boundary_loss(bnd_logts, bnd_labels)
+                    loss = seg_loss + bnd_loss_weight * bnd_loss
+                else:
+                    loss = seg_loss
 
             optimizer.zero_grad()
             scaler.scale(loss).backward()
@@ -342,17 +352,28 @@ def main():
             all_preds, all_true, all_cats = [], [], []
 
             with torch.no_grad():
-                for slices, geo, pts_xyz, sid_arr, part_labels, cat_ids in test_loader:
-                    slices = slices.to(device)
-                    geo = geo.to(device)
-                    pts_xyz = pts_xyz.to(device)
-                    sid_arr = sid_arr.to(device)
-                    cat_ids = cat_ids.to(device)
+                for batch in test_loader:
+                    (coarse_slices, coarse_geo, pts_xyz, coarse_sid_arr,
+                     fine_slices,   fine_geo,   fine_sid_arr,
+                     part_labels, _bnd_labels, cat_ids) = batch
+
+                    coarse_slices  = coarse_slices.to(device)
+                    coarse_geo     = coarse_geo.to(device)
+                    pts_xyz        = pts_xyz.to(device)
+                    coarse_sid_arr = coarse_sid_arr.to(device)
+                    fine_slices    = fine_slices.to(device)
+                    fine_geo       = fine_geo.to(device)
+                    fine_sid_arr   = fine_sid_arr.to(device)
+                    cat_ids        = cat_ids.to(device)
                     B, N = part_labels.shape
 
-                    # aux ignored during eval (per_timestep_logits is None)
                     part_logits, _ = model(
-                        slices, geo, sid_arr, cat_ids, pts_xyz, training=False
+                        coarse_slices, coarse_geo, coarse_sid_arr,
+                        cat_ids, pts_xyz,
+                        fine_slices=fine_slices,
+                        fine_geo=fine_geo,
+                        fine_sid_arr=fine_sid_arr,
+                        training=False,
                     )
 
                     for b in range(B):
@@ -411,7 +432,6 @@ def main():
                 f"loss={train_loss:.4f} | {elapsed:.0f}s"
             )
 
-        # Save last checkpoint for resume
         torch.save({
             'epoch': epoch + 1,
             'model': model.state_dict(),

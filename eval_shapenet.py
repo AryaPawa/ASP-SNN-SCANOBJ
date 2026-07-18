@@ -3,6 +3,11 @@ eval_shapenet.py — Evaluate ASP-SNN on ShapeNetPart test set.
 
 Usage:
     python eval_shapenet.py --ckpt checkpoints/shapenet_best.pt [--per_cat]
+
+Batch 3 update: unpacks the new 10-tuple dataloader (adds fine slicing
+tensors + boundary labels).  The boundary labels are ignored at eval time
+(they're a training-only signal). The fine slicing tensors are forwarded
+to the model to feed the multi-scale seg head.
 """
 
 import argparse
@@ -84,37 +89,57 @@ def main():
     )
 
     # Model
-    cfg.num_classes = NUM_PARTS
+    cfg.num_classes    = NUM_PARTS
     cfg.num_categories = NUM_CATEGORIES
-    cfg.use_category = True
-    cfg.in_channels = 6
+    cfg.use_category   = True
+    cfg.in_channels    = 6
     model = ASPSegmentor(cfg).to(device)
 
     ckpt = torch.load(args.ckpt, map_location=device, weights_only=False)
     state = ckpt.get('model', ckpt)
     # Handle DataParallel-saved checkpoints
     state = {k.replace('module.', ''): v for k, v in state.items()}
-    model.load_state_dict(state)
+    # strict=False so pre-Batch-3 checkpoints (which lack fine_encoder /
+    # boundary_head weights) can still be evaluated. Any missing weights
+    # will be left at their initialised values.
+    missing, unexpected = model.load_state_dict(state, strict=False)
+    if missing:
+        print(f"  [load] missing keys (using fresh init): {len(missing)} entries")
+    if unexpected:
+        print(f"  [load] unexpected keys (ignored):        {len(unexpected)} entries")
     model.eval()
 
     print(f"\nCheckpoint : {args.ckpt}")
     print(f"Epoch      : {ckpt.get('epoch', '?')}")
     print(f"Parameters : {sum(p.numel() for p in model.parameters()):,}")
 
-    # Evaluate
+    # ── Evaluate ──────────────────────────────────────────────────────
     all_preds, all_true, all_cats = [], [], []
 
     with torch.no_grad():
-        for slices, geo, pts_xyz, sid_arr, part_labels, cat_ids in loader:
-            slices = slices.to(device)
-            geo = geo.to(device)
-            pts_xyz = pts_xyz.to(device)
-            sid_arr = sid_arr.to(device)
-            cat_ids = cat_ids.to(device)
+        # Batch 3: 10-item unpacking (adds fine slicing tensors + bnd_labels)
+        for batch in loader:
+            (coarse_slices, coarse_geo, pts_xyz, coarse_sid_arr,
+             fine_slices,   fine_geo,   fine_sid_arr,
+             part_labels, _bnd_labels, cat_ids) = batch
+
+            coarse_slices  = coarse_slices.to(device)
+            coarse_geo     = coarse_geo.to(device)
+            pts_xyz        = pts_xyz.to(device)
+            coarse_sid_arr = coarse_sid_arr.to(device)
+            fine_slices    = fine_slices.to(device)
+            fine_geo       = fine_geo.to(device)
+            fine_sid_arr   = fine_sid_arr.to(device)
+            cat_ids        = cat_ids.to(device)
             B, N = part_labels.shape
 
             part_logits, _ = model(
-                slices, geo, sid_arr, cat_ids, pts_xyz, training=False
+                coarse_slices, coarse_geo, coarse_sid_arr,
+                cat_ids, pts_xyz,
+                fine_slices=fine_slices,
+                fine_geo=fine_geo,
+                fine_sid_arr=fine_sid_arr,
+                training=False,
             )
 
             for b in range(B):
