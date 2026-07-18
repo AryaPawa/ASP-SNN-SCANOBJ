@@ -1,5 +1,5 @@
 # configs/shapenet_seg.yaml — ShapeNetPart part segmentation
-# Batch 1 target: 84.5 – 85.5 Instance mIoU
+# Batch 2 target: 85.5 – 86.5 Instance mIoU
 # Roadmap goal (through all batches): 86.0 – 86.8 Instance mIoU
 
 # ── Dataset ────────────────────────────────────────────────────────────
@@ -28,7 +28,7 @@ d_ssp: 128
 T: 6
 point_feat_dim: 64
 
-# ── Encoder type (kept analog for Batch 1; Batch 3 will spike this) ────
+# ── Encoder type (kept analog for Batch 2; Batch 3 will spike this) ────
 encoder_type: analog
 encoder_T: 4
 encoder_lif_leak: 0.9
@@ -37,17 +37,36 @@ encoder_lif_threshold: 1.0
 # ── SSP ablation ───────────────────────────────────────────────────────
 ssp_mode: learned
 
-# ── A3: Category-conditional SSP ───────────────────────────────────────
-# Dimension of the learned category embedding fed into SSP. 8 is enough
-# for 16 categories. Set num_categories=0 (via use_category: false) to
-# disable this branch entirely.
+# ── A3 (Batch 1): Category-conditional SSP ─────────────────────────────
 cat_emb_dim: 8
 
-# ── Tier-1 SNN training best practices (from ScanObj wins) ─────────────
-# Batch 2 will extend loss_mode to a segmentation-specific dense TET.
-loss_mode: aux           # 'aux' for now; Batch 2 introduces 'dense_tet'
+# ── Tier-1 SNN training best practices ─────────────────────────────────
 lif_learnable: true
 lif_use_mpbn: true
+
+# ── A0 (Batch 2): Dense TET loss ───────────────────────────────────────
+# 'ce'         : single CE on final logits (backward-compat / Batch 1)
+# 'dense_tet'  : mean per-timestep per-point CE with equal weighting.
+#                Forces the seg head + belief pathway to be discriminative
+#                at every ASP timestep. Ref: Deng et al. TET ICLR 2022.
+#                Cost: seg head runs T times during training only. Eval is
+#                a single forward pass (no per-timestep cost).
+loss_mode: dense_tet
+
+# Optional MSE regularizer pulling each intermediate timestep's logits
+# toward the final-step logits. Small value stabilizes training. Set 0 to
+# disable. In classifier this was 0.05 (same value shown to work).
+tet_lambda: 0.05
+
+# ── A1 (Batch 2): Soft feature propagation ─────────────────────────────
+# When true, per-point local features are computed as an inverse-distance
+# weighted mixture of the fp_k nearest slice anchor features (PointNet++
+# style). This fixes the "all ~128 points in a slice share one 512-d
+# vector" resolution collapse. When false, falls back to hard slice
+# lookup (matches Batch 1 behaviour) — useful for A/B ablation.
+use_soft_fp: true
+fp_k: 3            # 3 nearest anchors is standard for PointNet++ F.P.
+fp_epsilon: 1e-8   # numerical stability for 1/distance
 
 # ── Training ───────────────────────────────────────────────────────────
 epochs: 300
@@ -64,39 +83,26 @@ tau_start: 1.0
 tau_end: 0.1
 tau_decay: 0.95
 
-# ── A4: Segmentation augmentation (stronger than default) ──────────────
-# Rotations
+# ── A4 (Batch 1): Segmentation augmentation ────────────────────────────
 aug_rotate_z: true
 aug_rotate_so3: false
 aug_so3_tilt: 0.26
 
-# A4: wider anisotropic scale range (was 0.8 / 1.25)
 aug_scale_lo: 0.66
 aug_scale_hi: 1.5
 
-# Translation
 aug_translate: 0.1
 
-# A4: tighter jitter defaults for segmentation (was σ=0.01, clip=0.05)
-# Rationale: heavy jitter shifts points across part boundaries, corrupting
-# labels. Tight jitter still adds useful noise without label drift.
 aug_jitter_sigma: 0.005
 aug_jitter_clip: 0.02
 
-# A4: random axis mirror (cheap invariance). Keep flip_x, flip_y on; flip_z
-# breaks gravity-aligned semantics so leave off for ShapeNet.
 aug_flip_x: true
 aug_flip_y: true
 aug_flip_z: false
 
-# A4: random point resampling with replacement
-# NOTE: enabling this REQUIRES the dataset __getitem__ to pass part_labels
-# into augment_seg AND to permute sid_arr by the same indices.
-# For Batch 1 we leave this OFF by default (opt-in via configs) until the
-# dataset integration is committed — see Batch 1 rollout note below.
+# Still off pending dataset-loader integration (see Batch 1 note)
 aug_resample: false
 
-# Per-slice point dropout
 aug_slice_dropout: 0.1
 
 # ── Logging ────────────────────────────────────────────────────────────

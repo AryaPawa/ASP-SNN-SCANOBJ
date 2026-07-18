@@ -3,6 +3,14 @@ train_shapenet.py — Train ASP-SNN on ShapeNetPart part segmentation.
 
 Usage:
     python train_shapenet.py [--config configs/shapenet_seg.yaml] [--resume ckpt.pt]
+
+Batch 2 upgrade (A0):
+    Adds cfg.loss_mode == 'dense_tet' — mean of per-timestep per-point CE
+    losses using the per-timestep logits returned by the segmentor. Analog
+    of Deng et al. TET (ICLR 2022) for dense prediction. Optional MSE
+    regularizer toward final-step logits controlled by cfg.tet_lambda.
+    When loss_mode is anything else (e.g. 'ce', 'aux'), the behaviour is
+    the same as Batch 1: single CE on the final part_logits.
 """
 
 import math
@@ -25,25 +33,35 @@ from datasets.shapenetpart import (
 from models.asp_segmentor import ASPSegmentor
 
 
-# ── Loss ──────────────────────────────────────────────────────────────────
+# ── Loss helpers ──────────────────────────────────────────────────────────
 
-def seg_loss_fn(part_logits, part_labels, cat_ids):
+def _make_valid_mask(cat_ids: torch.Tensor, num_parts: int,
+                     device: torch.device) -> torch.Tensor:
     """
-    CE loss with category-aware part masking.
+    Build the per-batch [B, P] boolean mask indicating which part labels
+    are valid for each shape's category. Precomputed once per batch and
+    reused across all T per-timestep loss evaluations (Batch 2 speedup).
+    """
+    B = cat_ids.shape[0]
+    # P1 FIX (kept): pre-fetch cat_ids to CPU once instead of .item() inside
+    # the inner loop (which forces B CPU syncs per forward pass).
+    cat_ids_cpu = cat_ids.detach().cpu().tolist()
+    valid_mask = torch.zeros(B, num_parts, device=device, dtype=torch.bool)
+    for b in range(B):
+        for pid in CATEGORY_TO_PARTS[cat_ids_cpu[b]]:
+            valid_mask[b, pid] = True
+    return valid_mask
+
+
+def _seg_ce_from_mask(part_logits: torch.Tensor,
+                      part_labels: torch.Tensor,
+                      valid_mask:  torch.Tensor) -> torch.Tensor:
+    """
+    Category-aware masked CE for one timestep.
     Invalid part logits masked to -1e9 in fp32 (NOT fp16 — avoids overflow).
     No label_smoothing (incompatible with -1e9 masking).
     """
     B, N, P = part_logits.shape
-    device = part_logits.device
-
-    # P1 FIX: pre-fetch cat_ids to CPU once instead of .item() inside the
-    # inner loop (which forces B CPU syncs per forward pass).
-    cat_ids_cpu = cat_ids.detach().cpu().tolist()
-    valid_mask = torch.zeros(B, P, device=device, dtype=torch.bool)
-    for b in range(B):
-        for pid in CATEGORY_TO_PARTS[cat_ids_cpu[b]]:
-            valid_mask[b, pid] = True
-
     mask_expanded = valid_mask.unsqueeze(1).expand(B, N, P)
     logits_masked = part_logits.float().clone()
     logits_masked[~mask_expanded] = -1e9
@@ -51,6 +69,66 @@ def seg_loss_fn(part_logits, part_labels, cat_ids):
     logits_flat = logits_masked.reshape(B * N, P)
     labels_flat = part_labels.reshape(B * N)
     return F.cross_entropy(logits_flat, labels_flat)
+
+
+def seg_loss_fn(part_logits, part_labels, cat_ids):
+    """
+    Legacy single-timestep CE loss. Kept for backward compatibility with
+    Batch 1 configs (loss_mode='ce' or 'aux').
+    """
+    valid_mask = _make_valid_mask(cat_ids, part_logits.shape[-1],
+                                  part_logits.device)
+    return _seg_ce_from_mask(part_logits, part_labels, valid_mask)
+
+
+def compute_seg_loss(part_logits: torch.Tensor,
+                     per_timestep_logits,
+                     part_labels: torch.Tensor,
+                     cat_ids:     torch.Tensor,
+                     loss_mode:   str = 'ce',
+                     tet_lambda:  float = 0.0) -> torch.Tensor:
+    """
+    Router that picks between legacy CE (single tensor) and dense TET
+    (per-timestep list) based on loss_mode. Precomputes the valid_mask
+    once and reuses it across timesteps for speed.
+
+    Args:
+        part_logits         : [B, N, P] — final logits (always required)
+        per_timestep_logits : list of [B, N, P] or None
+        part_labels         : [B, N]
+        cat_ids             : [B]
+        loss_mode           : 'ce' | 'dense_tet' (Batch 2)
+        tet_lambda          : MSE regularizer weight toward final logits
+    """
+    device     = part_logits.device
+    num_parts  = part_logits.shape[-1]
+    valid_mask = _make_valid_mask(cat_ids, num_parts, device)
+
+    use_dense = (loss_mode == 'dense_tet'
+                 and per_timestep_logits is not None
+                 and len(per_timestep_logits) > 0)
+
+    if use_dense:
+        # Equal-weighted mean of per-timestep CE (TET, Deng et al. ICLR 2022)
+        ce_terms = torch.stack([
+            _seg_ce_from_mask(lt, part_labels, valid_mask)
+            for lt in per_timestep_logits
+        ])
+        loss = ce_terms.mean()
+
+        # Optional MSE regularizer pulling each intermediate step toward
+        # the final-step logits (stabilizes training).
+        if tet_lambda > 0 and len(per_timestep_logits) > 1:
+            final = per_timestep_logits[-1].detach()
+            mse_terms = torch.stack([
+                F.mse_loss(lt, final)
+                for lt in per_timestep_logits[:-1]
+            ])
+            loss = loss + tet_lambda * mse_terms.mean()
+        return loss
+
+    # Legacy fall-through
+    return _seg_ce_from_mask(part_logits, part_labels, valid_mask)
 
 
 # ── mIoU ──────────────────────────────────────────────────────────────────
@@ -91,8 +169,6 @@ def compute_instance_miou(pred_parts, true_parts, cat_ids, n_points):
             per_cat[CATEGORY_NAMES[cat]] = float(np.mean(ious))
             populated_ious.append(per_cat[CATEGORY_NAMES[cat]])
         else:
-            # Category absent from test split → mark explicitly but don't drag
-            # cls_miou down with a 0.
             per_cat[CATEGORY_NAMES[cat]] = float('nan')
     cls_miou = float(np.mean(populated_ious)) if populated_ious else 0.0
     return inst_miou, cls_miou, per_cat
@@ -121,7 +197,6 @@ def main():
     test_ds = ShapeNetPartDataset(cfg.data_dir, 'test', cfg)
 
     pw = cfg.num_workers > 0
-    # drop_last safety: only drop if we have enough samples to spare
     drop_last = len(train_ds) >= cfg.batch_size * 2
     train_loader = DataLoader(
         train_ds, batch_size=cfg.batch_size, shuffle=True,
@@ -135,7 +210,6 @@ def main():
     )
 
     # ── Model ─────────────────────────────────────────────────────────
-    # Override config for segmentor
     cfg.num_classes = NUM_PARTS
     cfg.num_categories = NUM_CATEGORIES
     cfg.use_category = True
@@ -144,6 +218,14 @@ def main():
     model = ASPSegmentor(cfg).to(device)
     n_params = sum(p.numel() for p in model.parameters())
     print(f"Parameters: {n_params:,}")
+
+    # ── Loss mode (Batch 2 A0) ────────────────────────────────────────
+    loss_mode  = getattr(cfg, 'loss_mode', 'ce')
+    tet_lambda = getattr(cfg, 'tet_lambda', 0.0)
+    print(f"Loss mode: {loss_mode}" +
+          (f" (TET lambda={tet_lambda})" if loss_mode == 'dense_tet' else ""))
+    if loss_mode == 'dense_tet':
+        print(f"  Per-timestep seg head will run T={cfg.T} times during training.")
 
     # ── Optimizer with differential LR ────────────────────────────────
     enc_scale = getattr(cfg, 'encoder_lr_scale', 0.1)
@@ -160,7 +242,6 @@ def main():
         {"params": new_params, "lr": cfg.lr},
     ], weight_decay=cfg.weight_decay)
 
-    # Warmup + cosine LR
     def lr_lambda(epoch):
         warmup = getattr(cfg, 'warmup_epochs', 10)
         if epoch < warmup:
@@ -176,7 +257,13 @@ def main():
     best_inst_iou = 0.0
     if args.resume and os.path.exists(args.resume):
         ckpt = torch.load(args.resume, map_location=device, weights_only=False)
-        model.load_state_dict(ckpt['model'])
+        # strict=False so Batch 1 checkpoints can be resumed (they don't
+        # contain the new belief_to_seg_global weight added in Batch 2).
+        missing, unexpected = model.load_state_dict(ckpt['model'], strict=False)
+        if missing:
+            print(f"  [resume] missing keys (initialized fresh): {missing}")
+        if unexpected:
+            print(f"  [resume] unexpected keys (ignored): {unexpected}")
         optimizer.load_state_dict(ckpt['optimizer'])
         scheduler.load_state_dict(ckpt['scheduler'])
         scaler.load_state_dict(ckpt['scaler'])
@@ -194,7 +281,6 @@ def main():
     for epoch in range(start_epoch, cfg.epochs):
         t0 = time.time()
 
-        # Gumbel temperature annealing
         tau = max(cfg.tau_end, cfg.tau_start * (cfg.tau_decay ** epoch))
         model.gumbel_tau.fill_(tau)
 
@@ -204,7 +290,8 @@ def main():
         n_total_batches = len(train_loader)
         log_every = max(1, n_total_batches // 10)
 
-        for batch_idx, (slices, geo, pts_xyz, sid_arr, part_labels, cat_ids) in enumerate(train_loader):
+        for batch_idx, (slices, geo, pts_xyz, sid_arr, part_labels, cat_ids) \
+                in enumerate(train_loader):
             slices = slices.to(device, non_blocking=True)
             geo = geo.to(device, non_blocking=True)
             pts_xyz = pts_xyz.to(device, non_blocking=True)
@@ -213,10 +300,19 @@ def main():
             cat_ids = cat_ids.to(device, non_blocking=True)
 
             with autocast(device_type=device.type, enabled=cfg.use_amp):
-                part_logits, _ = model(
+                # Batch 2: model returns (part_logits, aux) where
+                # aux['per_timestep_logits'] is populated when dense_tet is on.
+                part_logits, aux = model(
                     slices, geo, sid_arr, cat_ids, pts_xyz, training=True
                 )
-                loss = seg_loss_fn(part_logits, part_labels, cat_ids)
+                per_t = aux.get('per_timestep_logits', None) if isinstance(aux, dict) else None
+
+                loss = compute_seg_loss(
+                    part_logits, per_t,
+                    part_labels, cat_ids,
+                    loss_mode=loss_mode,
+                    tet_lambda=tet_lambda,
+                )
 
             optimizer.zero_grad()
             scaler.scale(loss).backward()
@@ -254,6 +350,7 @@ def main():
                     cat_ids = cat_ids.to(device)
                     B, N = part_labels.shape
 
+                    # aux ignored during eval (per_timestep_logits is None)
                     part_logits, _ = model(
                         slices, geo, sid_arr, cat_ids, pts_xyz, training=False
                     )
@@ -284,12 +381,10 @@ def main():
                 f"Cls mIoU={cls_iou*100:.2f}% | {elapsed:.0f}s"
             )
 
-            # Per-category printout every 25 epochs
             if (epoch + 1) % 25 == 0:
                 for cn, iou in sorted(per_cat.items(), key=lambda x: x[1]):
                     print(f"    {cn:<14} {iou*100:5.1f}%")
 
-            # Save best
             if inst_iou > best_inst_iou:
                 best_inst_iou = inst_iou
                 torch.save({

@@ -15,18 +15,31 @@ Architecture:
         PerPointBranch: pts_xyz [B,N,3] -> MLP -> [B,N, point_feat_dim]
         SegHead MLP: [local | global | point_feat | (cat_onehot) | xyz] -> [B,N, num_classes]
 
-Batch 1 upgrades:
-    A2 — Global context pathway ported from the classifier: mean+max pool over
-         all M slice tokens, projected to feat_dim. This replaces the previous
-         weak `mean over belief snapshots` global signal. The global_ctx is
-         (a) fused into every ASP timestep via a learnable gate (so LIF sees
-         it during temporal reasoning), and (b) passed directly as the
-         `global_feat` input to the segmentation head (uncompressed by LIF
-         bottleneck, matches classifier's design).
+Batch 1 upgrades (already applied):
+    A2 — Global context pathway (mean+max pool of all M slice tokens)
+    A3 — Category-conditional SSP (ShapeNetPart cat_id fed to SSP)
 
-    A3 — Category-conditional SSP: for ShapeNetPart, cat_ids are propagated
-         into the SSP module so the traversal policy is category-aware from
-         t=0. Fully backward compatible with S3DIS (num_categories=0).
+Batch 2 upgrades (new):
+    A0 — Dense TET loss support: per-timestep segmentation logits computed
+         inside the ASP loop. When cfg.loss_mode == 'dense_tet', the seg
+         head runs at every timestep with a per-timestep belief-modulated
+         global signal, giving the LIF + seg pathway supervised gradient
+         at every step (analog of Deng et al. TET, ICLR 2022, for dense
+         prediction). Adds one small Linear (hidden_dim -> feat_dim) that
+         is zero-initialized so this is a NO-OP when dense_tet is off.
+
+    A1 — Soft feature propagation: replaces the hard slice lookup
+         `local_feats = all_feats[b, sid_arr]` with a k-nearest inverse-
+         distance weighted mixture over slice anchors. This kills the
+         resolution-collapse problem where every ~128 points in a slice
+         shared an identical 512-d feature vector. Direct analog of
+         PointNet++'s Feature Propagation (Qi et al. NeurIPS 2017).
+         Config-gated via `use_soft_fp` for A/B testing.
+
+Return signature: `(part_logits, aux)` where `aux` is a dict:
+    - aux['belief_list']         : list of [B, hidden_dim] per timestep
+    - aux['per_timestep_logits'] : list of [B, N, num_classes] or None
+Backward compatible with callers that do `part_logits, _ = model(...)`.
 """
 
 import torch
@@ -71,17 +84,12 @@ class SegmentationHead(nn.Module):
     Input per point:
         ShapeNet: [local(512) | global(512) | point(64) | cat(16) | xyz(3)] = 1107
         S3DIS:    [local(512) | global(512) | point(64) | xyz(3)]           = 1091
-
-    Note (A2): the `global_feat` input is now the mean+max pooled slice-token
-    representation (dim = feat_dim), not the LIF-compressed belief mean.
-    So the in_dim is now `feat_dim` for global, not hidden_dim.
     """
 
     def __init__(self, feat_dim: int = 512, point_feat_dim: int = 64,
                  num_classes: int = 50, num_categories: int = 0,
                  xyz_dim: int = 3):
         super().__init__()
-        # feat_dim is used TWICE: once for local, once for global (A2).
         in_dim = feat_dim * 2 + point_feat_dim + num_categories + xyz_dim
 
         self.mlp = nn.Sequential(
@@ -103,7 +111,7 @@ class SegmentationHead(nn.Module):
                 cat_onehot, pts_xyz):
         """
         local_feats  : [B, N, feat_dim]
-        global_feat  : [B, feat_dim]        (A2: pooled slice tokens)
+        global_feat  : [B, feat_dim]
         point_feats  : [B, N, point_feat_dim]
         cat_onehot   : [B, num_cats] or None
         pts_xyz      : [B, N, 3]
@@ -157,10 +165,7 @@ class ASPSegmentor(nn.Module):
             norm_first=True,
         )
 
-        # ── SSP with category conditioning (A3) ────────────────────────
-        # Segmentor passes num_categories only when the dataset provides
-        # category labels (ShapeNetPart, use_category=True).
-        # S3DIS gets num_categories=0 → SSP identical to original.
+        # SSP with category conditioning (A3)
         self.ssp = SSP(
             belief_dim=cfg.hidden_dim,
             geo_dim=cfg.geo_dim,
@@ -172,26 +177,21 @@ class ASPSegmentor(nn.Module):
         self.belief_to_feat = nn.Linear(cfg.hidden_dim, cfg.feat_dim, bias=False)
         self.belief_norm    = nn.LayerNorm(cfg.hidden_dim)
 
-        # ── Global context pathway (A2) ────────────────────────────────
-        # Mean+max pool over all M slice tokens -> feat_dim vector.
-        # Serves two purposes:
-        #   1) Fused into every ASP timestep's e_t so LIF has whole-object
-        #      context during temporal reasoning (mirrors classifier design).
-        #   2) Passed DIRECTLY as global_feat to the segmentation head, so
-        #      per-point classification sees the strong pooled signal rather
-        #      than the LIF-bottlenecked belief-mean used previously.
-        # Reference: PointNet (Qi et al. CVPR 2017) for mean+max pooling as
-        # a permutation-invariant set aggregator; Mnih et al. RAM (NeurIPS
-        # 2014) for glimpse-plus-global-context design.
+        # Global context pathway (A2)
         self.global_context = nn.Sequential(
             nn.Linear(cfg.feat_dim * 2, cfg.feat_dim, bias=False),
             nn.LayerNorm(cfg.feat_dim),
             nn.GELU(),
         )
-        # Learnable gate for how much global_ctx to fuse into ASP loop e_t.
-        # Initialized so sigmoid ≈ 0.62 (mild fusion) — model can push toward
-        # 0 (only focus slice) or 1 (all global) as needed.
         self.context_gate = nn.Parameter(torch.tensor(0.5))
+
+        # ── A0: Belief-to-seg-global projection ────────────────────────
+        # Zero-initialized so this is a no-op when dense_tet is not enabled.
+        # When dense_tet is on, this Linear learns to route belief info into
+        # the seg head at every timestep, giving the LIF pathway direct
+        # gradient signal from the per-point loss.
+        self.belief_to_seg_global = nn.Linear(cfg.hidden_dim, cfg.feat_dim, bias=False)
+        nn.init.zeros_(self.belief_to_seg_global.weight)
 
         # LIF head — num_classes=1 stub (not used for segmentation output)
         self.lif_head = MultiLayerLIF(
@@ -209,7 +209,6 @@ class ASPSegmentor(nn.Module):
                              torch.tensor(float(cfg.tau_start)))
 
         # Per-point branch
-        # For S3DIS we feed xyz+rgb+height (7 dims) to PerPointBranch
         pp_in = 3
         if getattr(cfg, 'use_height', False) and getattr(cfg, 'use_rgb', False):
             pp_in = 7  # xyz + rgb + height
@@ -217,7 +216,7 @@ class ASPSegmentor(nn.Module):
             pp_in = 6  # xyz + rgb
         self.point_branch = PerPointBranch(in_dim=pp_in, out_dim=point_feat_dim)
 
-        # Segmentation head — global_feat now has dim feat_dim (A2)
+        # Segmentation head
         self.seg_head = SegmentationHead(
             feat_dim=cfg.feat_dim,
             point_feat_dim=point_feat_dim,
@@ -232,22 +231,81 @@ class ASPSegmentor(nn.Module):
             return [1.0]
         return [0.1 + 0.9 * (t / (T - 1)) ** 2 for t in range(T)]
 
+    # ══════════════════════════════════════════════════════════════════
+    #  A1 — Soft Feature Propagation
+    # ══════════════════════════════════════════════════════════════════
+    def _soft_feature_propagation(
+        self,
+        all_feats:    torch.Tensor,   # [B, M, feat_dim]  (original order)
+        geo:          torch.Tensor,   # [B, M, geo_dim]   (original order)
+        pts_features: torch.Tensor,   # [B, N, F]         (first 3 = xyz)
+        sid_arr:      torch.Tensor,   # [B, N]            (legacy fallback)
+    ) -> torch.Tensor:
+        """
+        Inverse-distance weighted mixture of the fp_k nearest slice anchors
+        for each point. Analog of PointNet++ Feature Propagation.
+
+        Returns local_feats: [B, N, feat_dim]
+        """
+        B, M, feat_dim = all_feats.shape
+        N = pts_features.shape[1]
+        device = all_feats.device
+
+        use_soft_fp = getattr(self.cfg, 'use_soft_fp', True)
+        if not use_soft_fp:
+            # Legacy hard lookup — kept for A/B ablation.
+            b_idx = torch.arange(B, device=device).unsqueeze(1).expand(B, N)
+            return all_feats[b_idx, sid_arr.long()]
+
+        k_fp   = getattr(self.cfg, 'fp_k', 3)
+        fp_eps = getattr(self.cfg, 'fp_epsilon', 1e-8)
+
+        anchor_xyz = geo[:, :, :3]                        # [B, M, 3]
+        points_xyz = pts_features[:, :, :3]               # [B, N, 3]
+
+        # cdist is memory-efficient vs. explicit broadcasting.
+        # Use fp32 for numerical stability under AMP.
+        dist = torch.cdist(points_xyz.float(), anchor_xyz.float())   # [B, N, M]
+
+        # Guard against k > M (small-M configs)
+        k_use = min(k_fp, M)
+        knn_dist, knn_idx = dist.topk(k_use, dim=-1, largest=False)  # [B, N, k]
+
+        # Inverse-distance weights (normalized to sum to 1 over k neighbours)
+        inv_dist = 1.0 / (knn_dist + fp_eps)                          # [B, N, k]
+        weights  = inv_dist / inv_dist.sum(dim=-1, keepdim=True)      # [B, N, k]
+
+        # Gather features of the k nearest anchors
+        b_idx_k = (torch.arange(B, device=device)
+                   .view(B, 1, 1).expand(B, N, k_use))
+        knn_feats = all_feats[b_idx_k, knn_idx]           # [B, N, k, feat_dim]
+
+        # Weighted sum. Cast weights back to feature dtype for AMP.
+        weights_typed = weights.to(knn_feats.dtype)
+        local_feats = (weights_typed.unsqueeze(-1) * knn_feats).sum(dim=-2)
+        return local_feats                                # [B, N, feat_dim]
+
+    # ══════════════════════════════════════════════════════════════════
+    #  Forward
+    # ══════════════════════════════════════════════════════════════════
     def forward(self, slices, geo, sid_arr, cat_ids, pts_features,
                 training=True):
         """
         Args:
             slices:       [B, M, K, C]  per-slice point clouds
             geo:          [B, M, 8]     geometry descriptors
-            sid_arr:      [B, N]        slice-id per point (int)
+            sid_arr:      [B, N]        slice-id per point (int; legacy fallback)
             cat_ids:      [B]           category index (ShapeNet) or None
             pts_features: [B, N, F]     per-point features for PerPointBranch
-                          ShapeNet: [B, N, 3] (xyz)
-                          S3DIS:    [B, N, 7] (xyz + rgb + height)
             training:     bool
 
         Returns:
             part_logits:  [B, N, num_classes]
-            belief_list:  list of [B, hidden_dim] per timestep
+            aux:          dict with keys:
+                'belief_list'         : list of [B, hidden_dim] per timestep
+                'per_timestep_logits' : list of [B, N, num_classes] or None
+                                        (populated only when training and
+                                         loss_mode == 'dense_tet')
         """
         B, M, K, _ = slices.shape
         N      = sid_arr.shape[1]
@@ -260,6 +318,11 @@ class ASPSegmentor(nn.Module):
             f"PerPointBranch expects {pp_in_dim}. Check use_rgb/use_height config."
         )
 
+        # A0 flag: are we producing per-timestep seg logits for dense TET?
+        compute_per_t = training and (
+            getattr(self.cfg, 'loss_mode', 'aux') == 'dense_tet'
+        )
+
         # Category one-hot (ShapeNet) or None (S3DIS)
         if self.use_category and cat_ids is not None:
             cat_onehot = F.one_hot(cat_ids.long(), self.num_cats)
@@ -267,22 +330,28 @@ class ASPSegmentor(nn.Module):
             cat_onehot = None
 
         # Per-point branch
-        point_feats = self.point_branch(pts_features)  # [B, N, point_feat_dim]
+        point_feats = self.point_branch(pts_features)     # [B, N, point_feat_dim]
 
         # Encode all slices (original order — NOT sorted)
-        all_feats = self.feature_extractor(slices)       # [B, M, feat_dim]
+        all_feats = self.feature_extractor(slices)        # [B, M, feat_dim]
         pos       = self.pos_proj(geo[:, :, :3])
         all_feats = all_feats + pos
         all_feats = self.slice_transformer(all_feats)
 
-        # ── Global context over ALL M slices (A2) ──────────────────────
-        # Mean + max pool -> project to feat_dim. Used both inside the ASP
-        # loop and as the global input to the seg head.
+        # Global context over ALL M slices (A2)
         ctx_mean   = all_feats.mean(dim=1)                # [B, feat_dim]
         ctx_max    = all_feats.max(dim=1).values          # [B, feat_dim]
         global_ctx = self.global_context(
             torch.cat([ctx_mean, ctx_max], dim=-1)
         )                                                 # [B, feat_dim]
+
+        # ── A1: soft feature propagation (computed once, reused per step) ──
+        local_feats = self._soft_feature_propagation(
+            all_feats, geo, pts_features, sid_arr,
+        )                                                 # [B, N, feat_dim]
+
+        # xyz for seg head (always first 3 dims of pts_features)
+        pts_xyz = pts_features[:, :, :3]
 
         # Sort for SSP only
         order     = geo[:, :, 6].argsort(dim=1, descending=True)
@@ -290,17 +359,18 @@ class ASPSegmentor(nn.Module):
         geo_ord          = geo[batch_idx, order]
         all_feats_sorted = all_feats[batch_idx, order]
 
-        # ASP loop — no early exit for segmentation
-        states      = self.lif_head.init_state(B, device)
-        belief      = torch.zeros(B, self.cfg.hidden_dim, device=device)
-        vis_mask    = torch.zeros(B, M, dtype=torch.bool, device=device)
-        belief_list = []
+        # ASP loop
+        states              = self.lif_head.init_state(B, device)
+        belief              = torch.zeros(B, self.cfg.hidden_dim, device=device)
+        vis_mask            = torch.zeros(B, M, dtype=torch.bool, device=device)
+        belief_list         = []
+        per_timestep_logits = [] if compute_per_t else None
 
-        gate = torch.sigmoid(self.context_gate)          # A2
+        gate    = torch.sigmoid(self.context_gate)         # A2
+        u_last  = None                                     # will be set inside loop
 
         for t in range(self.cfg.T):
-            # A3: pass cat_ids into SSP for category-conditional scoring.
-            # When num_categories=0 (S3DIS) or cat_ids is None, SSP ignores it.
+            # A3: pass cat_ids to SSP for category-conditional scoring
             scores = self.ssp(belief, geo_ord, vis_mask, cat_ids=cat_ids)
 
             if training:
@@ -317,25 +387,47 @@ class ASPSegmentor(nn.Module):
             # Fuse selected slice + belief + global context (A2)
             e_t = (w.unsqueeze(-1) * all_feats_sorted).sum(dim=1)
             e_t = e_t + self.belief_to_feat(states[-1][0].detach())
-            e_t = e_t + gate * global_ctx                # A2
+            e_t = e_t + gate * global_ctx
 
             _, states, u_last = self.lif_head.step(e_t, states)
+
+            # ── A0: per-timestep seg logits with LIVE belief gradient ──
+            # `belief_live` is NOT detached, so the per-timestep CE loss
+            # backpropagates through belief_norm -> LIF cells at this step.
+            # This is what makes dense TET actually train the LIF pathway
+            # via the segmentation loss (analogous to how classifier TET
+            # supervises fc_out at every step).
+            if compute_per_t:
+                belief_live = self.belief_norm(u_last)
+                global_t = global_ctx + self.belief_to_seg_global(belief_live)
+                logits_t = self.seg_head(
+                    local_feats, global_t, point_feats, cat_onehot, pts_xyz,
+                )
+                per_timestep_logits.append(logits_t)
+
+            # Detached belief for the NEXT iteration's SSP (unchanged
+            # behaviour vs. Batch 1 — prevents recurrent graph growth).
             belief = self.belief_norm(u_last.detach())
             belief_list.append(belief)
 
-        # Per-point local features via direct lookup (original slice order)
-        b_idx       = torch.arange(B, device=device).unsqueeze(1).expand(B, N)
-        local_feats = all_feats[b_idx, sid_arr.long()]  # [B, N, feat_dim]
+        # ── Final part_logits ──────────────────────────────────────────
+        if compute_per_t:
+            # Reuse the last per-timestep logits (already computed with the
+            # final belief). Avoids a redundant seg_head call.
+            part_logits = per_timestep_logits[-1]
+        else:
+            # No dense TET: run seg head once at the end. Include belief
+            # modulation for consistency (belief_to_seg_global is zero-init
+            # so when dense TET was never on during training this reduces
+            # to global_ctx alone — matching Batch 1 behaviour).
+            final_belief = self.belief_norm(u_last) if u_last is not None else belief
+            final_global = global_ctx + self.belief_to_seg_global(final_belief)
+            part_logits = self.seg_head(
+                local_feats, final_global, point_feats, cat_onehot, pts_xyz,
+            )
 
-        # Extract xyz from pts_features (always first 3 dims)
-        pts_xyz = pts_features[:, :, :3]
-
-        # ── Segmentation head ──────────────────────────────────────────
-        # A2 change: use global_ctx (strong pooled feature) as the global
-        # input, not the belief-mean. The belief_list is still returned
-        # for downstream loss variants that may use it (e.g. Batch 2 dense TET).
-        part_logits = self.seg_head(
-            local_feats, global_ctx, point_feats, cat_onehot, pts_xyz,
-        )
-
-        return part_logits, belief_list
+        aux = {
+            'belief_list':         belief_list,
+            'per_timestep_logits': per_timestep_logits,
+        }
+        return part_logits, aux
