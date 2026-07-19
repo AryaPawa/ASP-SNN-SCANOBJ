@@ -49,8 +49,8 @@ SEG_CLASSES = {
     'Motorbike': [30, 31, 32, 33, 34, 35], 'Mug': [36, 37], 'Pistol': [38, 39, 40],
     'Rocket': [41, 42, 43], 'Skateboard': [44, 45], 'Table': [46, 47, 48, 49],
 }
-SYNSET_TO_PART_OFFSET = {
-    CATEGORY_IDS[cat]: SEG_CLASSES[cat][0] for cat in CATEGORY_ORDER
+SYNSET_TO_VALID_PARTS = {
+    CATEGORY_IDS[cat]: set(SEG_CLASSES[cat]) for cat in CATEGORY_ORDER
 }
 
 
@@ -100,8 +100,19 @@ def convert_entries(raw_dir, out_dir, out_split_name, entries, num_points, chunk
                 skipped += 1
                 continue
             xyz = raw[:, 0:3]
-            local_part = raw[:, 6].astype(int)
-            global_part = local_part + SYNSET_TO_PART_OFFSET[synset]
+            # NOTE: the raw label column in this dataset is already the
+            # GLOBAL 0-49 part id, not a per-category local index -- do
+            # NOT add a category offset here. (Confirmed empirically:
+            # adding the offset produced ids exactly one category-offset
+            # too high, e.g. Knife shapes landing in Skateboard's range.)
+            global_part = raw[:, 6].astype(int)
+
+            valid_ids = SYNSET_TO_VALID_PARTS[synset]
+            seen_ids = set(np.unique(global_part).tolist())
+            if not seen_ids.issubset(valid_ids):
+                skipped += 1
+                continue
+
             xyz_s, part_s = sample_points(xyz, global_part, num_points, rng)
 
             data[valid] = xyz_s
