@@ -93,3 +93,19 @@ log_dir: logs
 ckpt_dir: checkpoints
 seed: 42
 num_workers: 8
+# ── B1: Lovász-Softmax loss ────────────────────────────────────────────
+# Directly optimizes mIoU (the eval metric). Combined with CE + class
+# weights, complements them by targeting the IoU surrogate on rare classes.
+# Reference: Berman et al. CVPR 2018.
+use_lovasz: true
+lovasz_lambda: 1.0         # standard weighting in LiDAR seg literature
+
+# ── E1: Room-level ASP prior ───────────────────────────────────────────
+# Precomputed once per room (at dataset init) via FPS + KNN + handcrafted
+# statistics. Injected into the initial LIF belief state u_0 through a
+# zero-initialized learnable projection. Preserves the ASP thesis: the
+# LIF membrane state acts as compressed belief; we simply seed that
+# belief with a room-level prior instead of zeros.
+use_room_prior: true
+room_prior_anchors: 64     # FPS anchors over the whole room
+room_prior_k: 32           # KNN per anchor
