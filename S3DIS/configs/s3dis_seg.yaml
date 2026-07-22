@@ -1,23 +1,22 @@
 # configs/s3dis_seg.yaml — S3DIS scene segmentation
 # Protocol: train on Areas 1,2,3,4,6 — test on Area 5
-# Target: 55-62% mIoU
 # Optimised for NVIDIA H100 80GB
 
-# ── Dataset ────────────────────────────────────────────────────────────
+# ── Dataset (A3: larger blocks, more points for indoor context) ────────
 dataset: s3dis
 data_dir: data/s3dis
-num_points: 4096
+num_points: 8192           # was 4096
 num_classes: 13
 use_category: false
 test_area: 5
-block_size: 1.0
+block_size: 2.0            # was 1.0
 use_rgb: true
 use_height: true
-input_channels: 7        # xyz(3) + rgb(3) + height(1)
+input_channels: 7          # xyz(3) + rgb(3) + height(1)
 
 # ── Slicing ────────────────────────────────────────────────────────────
 num_slices: 16
-points_per_slice: 256
+points_per_slice: 512      # was 256 — scale K with num_points
 geo_dim: 8
 
 # ── Model ──────────────────────────────────────────────────────────────
@@ -29,19 +28,25 @@ hidden_dim: 512
 num_lif_layers: 3
 lif_leak: 0.9
 lif_threshold: 1.0
+lif_learnable: true        # DIET-SNN learnable leak + threshold
+lif_use_mpbn: true         # Membrane Potential BN (Guo et al. ICCV 2023)
 d_ssp: 128
 T: 6
 point_feat_dim: 64
 
-# ── Training (H100-tuned: larger batch, fewer epochs) ──────────────────
-epochs: 100              # 100 is sufficient for S3DIS (most papers use 100-300)
-batch_size: 64           # H100 80GB can easily handle 64; was 16 = 4x increase
-lr: 0.002                # Scaled with sqrt(4) for stability vs original lr=1e-3
+# ── Training (H100-tuned) ──────────────────────────────────────────────
+epochs: 100
+batch_size: 32             # was 64 — halved due to 2x points + 2x block
+lr: 0.0015                 # sqrt(0.5) rescale from prev 0.002
 weight_decay: 0.01
 grad_clip: 1.0
 warmup_epochs: 5
 use_amp: true
 use_class_weights: true
+
+# ── Loss (A4: TET replaces active_loss_seg with conf penalty) ──────────
+loss_mode: tet             # 'tet' or 'aux' (legacy)
+tet_lambda: 0.05           # MSE regularization toward final-step logits
 
 # ── Gumbel temperature ─────────────────────────────────────────────────
 tau_start: 1.0
@@ -59,9 +64,32 @@ aug_color_drop: 0.2
 aug_color_jitter: 0.05
 aug_elastic: false
 
+# Simplified PointWOLF Augmentation (existing)
+aug_pointwolf: true
+aug_pointwolf_num_anchors: 4
+aug_pointwolf_radius: 0.4
+aug_pointwolf_scale_lo: 0.75
+aug_pointwolf_scale_hi: 1.25
+
+# PointCutMix Augmentation (existing)
+aug_cutmix: true
+aug_cutmix_prob: 0.5
+
+# ── Neuromorphic augmentation ──────────────────────────────────────────
+spike_dropout: 0.1
+
+# ── Knowledge Distillation (KD) ────────────────────────────────────────
+kd_teacher_epochs: 30      # Set to 0 to disable teacher pre-training
+kd_temp: 4.0
+kd_lam: 0.5
+
+# ── Test-time augmentation (A2) ────────────────────────────────────────
+# Used by eval_s3dis.py --n_votes flag (default 3)
+n_votes: 3
+
 # ── Logging ────────────────────────────────────────────────────────────
 eval_interval: 5
 log_dir: logs
 ckpt_dir: checkpoints
 seed: 42
-num_workers: 8           # H100 cluster typically has 32+ CPUs
+num_workers: 8
