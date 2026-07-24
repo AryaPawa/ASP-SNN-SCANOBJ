@@ -1,6 +1,6 @@
 # configs/shapenet_seg.yaml — ShapeNetPart part segmentation
-# Batch 4 target: 85.5 – 86.5 Ins mIoU with system-level α starting to move.
-# Roadmap goal (all batches): 86.0 – 86.8 Ins mIoU with α ≥ 5x.
+# Batch 5 target: 85.5 – 86.5 Ins mIoU with system-level α = 5-10x.
+# The efficiency headline number for the paper lands in this batch.
 
 # ── Dataset ────────────────────────────────────────────────────────────
 dataset: shapenet
@@ -35,21 +35,43 @@ d_ssp: 128
 T: 6
 point_feat_dim: 64
 
-# ── Encoder type (kept analog until final batch) ───────────────────────
-encoder_type: analog
+# ── B3 (Batch 5): Spiking Coarse Encoder ────────────────────────────────
+# 'analog'  : original EdgeConv with ReLU. α_system ≈ 1.1x with everything else spiking.
+# 'spiking' : ReLU replaced with LIF neurons; encoder runs T_enc timesteps.
+#             Shifts encoder compute from MAC to AC. This is what pushes
+#             α_system from ~1.2x (Batch 4) to 5-10x (Batch 5).
+#
+# Reference: Ren et al. Spiking PointNet (NeurIPS 2023) — direct-training
+# spiking encoder for point clouds; Yao et al. Spike-driven Transformer V2
+# (ICLR 2024) — everything-spiking architecture; SPM (arXiv 2504.14371).
+encoder_type: spiking
 encoder_T: 4
 encoder_lif_leak: 0.9
 encoder_lif_threshold: 1.0
 
+# ── B3: Warm-start from an analog-trained checkpoint (highly recommended) ─
+# Spiking encoders trained from scratch typically lose 1-3 Ins mIoU vs.
+# analog. Warm-starting the encoder's Conv/Linear weights from a well-
+# trained analog checkpoint recovers most/all of that gap because the
+# static-input direct-training convention lets the same weights work for
+# both analog and spiking forward passes (LIF replaces ReLU; the linear
+# projections are identical).
+#
+# Workflow:
+#   1) Train Batches 1-4 with encoder_type: analog -> checkpoints/shapenet_best.pt
+#   2) Set warm_start_from below to that checkpoint path
+#   3) Change encoder_type to spiking (already done above)
+#   4) Retrain for ~150 epochs (see epochs override below)
+#
+# When warm_start_from is null, training starts from scratch.
+# Only the encoder's compatible tensors are loaded; strict=False for all
+# other keys so the LIF-specific tensors (learnable leak/threshold, MPBN
+# running stats) initialize fresh.
+warm_start_from: null                # e.g. "checkpoints/shapenet_best_analog.pt"
+
 # ── B2 (Batch 4): Segmentation head type ───────────────────────────────
-# 'spiking' (new default) — SpikingSegmentationHead (Batch 4). Three LIF
-#            cells run for T=seg_head_T timesteps with static-input encoding.
-#            Spike-only inter-layer communication. Final analog classifier
-#            reads out the average membrane of the last cell. This is the
-#            change that lets system α actually move for segmentation.
-# 'analog'  — original Batch 3 seg head (Linear+BN+ReLU). Ablation only.
 seg_head_type: spiking
-seg_head_T: 2                    # 2 timesteps is the sweet spot for accuracy/energy
+seg_head_T: 2
 seg_head_lif_leak: 0.9
 seg_head_lif_threshold: 1.0
 
@@ -79,18 +101,21 @@ bnd_k: 10
 bnd_loss_weight: 0.1
 
 # ── Training ───────────────────────────────────────────────────────────
-# NOTE for Batch 4: with spiking seg head + dense TET, the head runs
-# T * seg_head_T = 12 spiking forward passes per training step. This
-# raises per-step wall-clock by ~1.2x relative to Batch 3. Total training
-# time is still bounded, but consider raising warmup to 15 epochs so the
-# spiking head has time to settle before cosine decay bites in.
+# Batch 5 training notes:
+#   - Warmup up from 15 -> 25: spiking encoder + spiking seg head need
+#     more time to reach stable firing regimes before cosine decay bites.
+#   - encoder_lr_scale up from 0.1 -> 0.2 when warm-starting: encoder
+#     weights are pre-tuned so we don't need to hobble the LR. When training
+#     from scratch (warm_start_from: null), consider dropping back to 0.1.
+#   - epochs 300 -> 250 when warm-starting (encoder already converged) or
+#     keep at 300 when from scratch.
 epochs: 300
 batch_size: 32
 lr: 3e-4
-encoder_lr_scale: 0.1
+encoder_lr_scale: 0.2                # 0.1 -> 0.2 (see note above)
 weight_decay: 0.01
 grad_clip: 1.0
-warmup_epochs: 15                # 10 → 15 (spiking head warm-up)
+warmup_epochs: 25                    # 15 -> 25 (spiking encoder settling)
 use_amp: true
 
 # ── Gumbel temperature ─────────────────────────────────────────────────

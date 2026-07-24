@@ -240,7 +240,6 @@ def main():
     test_loader = DataLoader(
         test_ds, batch_size=cfg.batch_size, shuffle=False,
         num_workers=cfg.num_workers, pin_memory=True,
-        drop_last=True, 
         persistent_workers=pw_,
     )
 
@@ -404,7 +403,6 @@ def main():
         # ── Eval ──────────────────────────────────────────────────────
         eval_interval = getattr(cfg, 'eval_interval', 5)
         if (epoch + 1) % eval_interval == 0 or epoch == cfg.epochs - 1:
-            eval_model = unwrap(model)
             model.eval()
             all_preds, all_true, all_cats = [], [], []
 
@@ -424,7 +422,7 @@ def main():
                     cat_ids        = cat_ids.to(device)
                     B, N = part_labels.shape
 
-                    part_logits, _ =eval_model(
+                    part_logits, _ = model(
                         coarse_slices, coarse_geo, coarse_sid_arr,
                         cat_ids, pts_xyz,
                         fine_slices=fine_slices,
